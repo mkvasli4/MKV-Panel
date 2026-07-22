@@ -31,268 +31,11 @@ const DOWNSTREAM_GRAIN_TAIL_THRESHOLD = 512;
 const DOWNSTREAM_GRAIN_SILENT_MS = 1;
 const TCP_CONCURRENCY = 4;
 const PRELOAD_RACE_DIAL = true;
-
-// ============================================
-// کلاس اصلی دور زدن محدودیت - نسخه سازگار با Workers
-// ترکیب 4 فاکتور: IP + TLS Fingerprint + Cookie Consistency + Timing
-// دو روش اصلی: Request Waterfall + TLS Fingerprint Rotation
-// ============================================
-class RateLimitBypasser {
-    constructor() {
-        this.userAgents = [
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
-            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1',
-            'Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36'
-        ];
-        this.acceptLanguages = [
-            'en-US,en;q=0.9',
-            'fa-IR,fa;q=0.8,en;q=0.5',
-            'en-GB,en;q=0.8,fa;q=0.4'
-        ];
-        this.secChUaPlatforms = ['Windows', 'macOS', 'Linux', 'iOS', 'Android'];
-        this.cookieJar = new Map(); // ذخیره کوکی برای هر هویت مجازی
-        this.fingerprintPool = [];
-        this.requestTimestamps = [];
-        this.sessionCount = 0;
-    }
-
-    // مرحله ۱: تولید هدرهای تصادفی
-    generateRandomHeaders() {
-        const randomUA = this.userAgents[Math.floor(Math.random() * this.userAgents.length)];
-        const randomLang = this.acceptLanguages[Math.floor(Math.random() * this.acceptLanguages.length)];
-        const randomPlatform = this.secChUaPlatforms[Math.floor(Math.random() * this.secChUaPlatforms.length)];
-        return {
-            'User-Agent': randomUA,
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': randomLang,
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Cache-Control': Math.random() > 0.5 ? 'no-cache' : 'max-age=0',
-            'Sec-Ch-Ua': `"Not/A)Brand";v="99", "Chromium";v="123", "Google Chrome";v="123"`,
-            'Sec-Ch-Ua-Platform': `"${randomPlatform}"`,
-            'Sec-Ch-Ua-Mobile': Math.random() > 0.7 ? '?1' : '?0',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': Math.random() > 0.5 ? 'same-origin' : 'none',
-            'Sec-Fetch-User': '?1',
-            'Upgrade-Insecure-Requests': '1',
-            'DNT': Math.random() > 0.8 ? '1' : '0',
-            'Referer': Math.random() > 0.5 ? 'https://www.google.com/' : 'https://t.me/',
-            'Connection': 'keep-alive'
-        };
-    }
-
-    // مرحله ۲: چرخش TLS Fingerprint - شبیه‌سازی در Workers
-    async createRotatedTlsSocket(host, port, options = {}) {
-        const jitter = options.timeout ? (options.timeout % 2000) : Math.floor(Math.random() * 2000);
-        const timeout = (options.timeout || 10000) + jitter;
-        try {
-            const socket = connect({ hostname: host, port: port });
-            this.fingerprintPool.push({ host, port, ts: Date.now(), jitter });
-            if (this.fingerprintPool.length > 100) this.fingerprintPool.shift();
-            await Promise.race([
-                socket.opened,
-                new Promise((_, reject) => setTimeout(() => reject(new Error('TLS socket timeout')), timeout))
-            ]);
-            return socket;
-        } catch (e) {
-            try {
-                return connect({ hostname: host, port: port });
-            } catch (_) {
-                throw e;
-            }
-        }
-    }
-
-    // مرحله ۵: محاسبه نرخ درخواست اخیر
-    getRecentRequestRate() {
-        const now = Date.now();
-        const oneMinuteAgo = now - 60000;
-        const recentRequests = this.requestTimestamps.filter(t => t > oneMinuteAgo);
-        return recentRequests.length;
-    }
-
-    // مرحله ۷: توزیع درخواست بین پروکسی‌ها / Railway
-    getProxyForRequest(index) {
-        if (typeof RAILWAY_BACKENDS === 'undefined' || !RAILWAY_BACKENDS.length) {
-            return null;
-        }
-        if (index === 0) return null; // مستقیم
-        const backendHost = RAILWAY_BACKENDS[(index - 1) % RAILWAY_BACKENDS.length];
-        return `https://${backendHost}`;
-    }
-
-    // مرحله ۴: ارسال درخواست با تأخیر و هدر متفاوت
-    async sendRequestWithDelay(url, delay, index) {
-        if (delay > 0) {
-            await new Promise(resolve => setTimeout(resolve, delay));
-        }
-        const headers = this.generateRandomHeaders();
-        const sessionId = `session_${this.sessionCount++}_${Date.now()}`;
-        const cookies = this.cookieJar.get(sessionId) || [];
-        if (cookies.length > 0) {
-            headers['Cookie'] = cookies.join('; ');
-        }
-        const proxyBase = this.getProxyForRequest(index);
-        let targetUrl = url;
-        if (proxyBase) {
-            try {
-                const orig = new URL(url);
-                const proxyUrl = new URL(proxyBase);
-                proxyUrl.pathname = orig.pathname;
-                proxyUrl.search = orig.search;
-                targetUrl = proxyUrl.toString();
-            } catch (_) {
-                targetUrl = proxyBase;
-            }
-        }
-        try {
-            const response = await fetch(targetUrl, {
-                method: 'GET',
-                headers: headers,
-                cf: { cacheTtl: 0, cacheEverything: false }
-            });
-            const setCookies = response.headers.get('set-cookie');
-            if (setCookies) {
-                const existingCookies = this.cookieJar.get(sessionId) || [];
-                existingCookies.push(setCookies);
-                this.cookieJar.set(sessionId, existingCookies);
-            }
-            this.requestTimestamps.push(Date.now());
-            if (this.requestTimestamps.length > 20) this.requestTimestamps.shift();
-            return {
-                status: response.status,
-                headers: Object.fromEntries(response.headers),
-                body: await response.text(),
-                sessionId: sessionId,
-                url: targetUrl
-            };
-        } catch (e) {
-            this.requestTimestamps.push(Date.now());
-            if (this.requestTimestamps.length > 20) this.requestTimestamps.shift();
-            return { error: e.message, sessionId: sessionId, url: targetUrl };
-        }
-    }
-
-    // مرحله ۳: سیستم Waterfall با جیتر هوشمند
-    async requestWaterfall(url, count = 5) {
-        const requests = [];
-        const now = Date.now();
-        this.requestTimestamps.push(now);
-        if (this.requestTimestamps.length > 20) this.requestTimestamps.shift();
-        const recentRate = this.getRecentRequestRate();
-        const jitterBase = Math.max(50, Math.min(500, 10000 / (recentRate + 1)));
-        for (let i = 0; i < count; i++) {
-            const jitter = jitterBase + Math.floor(Math.random() * jitterBase);
-            const delay = i * jitter;
-            requests.push(this.sendRequestWithDelay(url, delay, i));
-        }
-        const results = [];
-        for (const req of requests) {
-            try {
-                const result = await req;
-                results.push(result);
-            } catch (e) {
-                results.push({ error: e.message });
-            }
-        }
-        return results;
-    }
-
-    // مرحله ۶: سیستم Failover و Retry هوشمند - نسخه متنی
-    async smartRetry(url, maxRetries = 5) {
-        let lastError = null;
-        for (let attempt = 0; attempt < maxRetries; attempt++) {
-            const headers = this.generateRandomHeaders();
-            const endpoints = [url];
-            if (typeof RAILWAY_BACKENDS !== 'undefined') {
-                try {
-                    const u = new URL(url);
-                    const isRailwayRelated = RAILWAY_BACKENDS.some(b => u.hostname.includes(b)) || u.pathname.includes('/Ma_Ke_Vaslim') || u.pathname.includes('/railway-io/');
-                    if (isRailwayRelated) {
-                        for (const backend of RAILWAY_BACKENDS) {
-                            const alt = new URL(url);
-                            alt.hostname = backend;
-                            endpoints.push(alt.toString());
-                        }
-                    }
-                } catch (_) {}
-            }
-            const targetUrl = endpoints[attempt % endpoints.length];
-            try {
-                const response = await fetch(targetUrl, {
-                    method: 'GET',
-                    headers: headers,
-                    cf: { cacheTtl: 0 }
-                });
-                this.requestTimestamps.push(Date.now());
-                if (this.requestTimestamps.length > 20) this.requestTimestamps.shift();
-                if (response.status === 200) {
-                    return await response.text();
-                } else if (response.status === 429 || response.status === 503) {
-                    const backoff = Math.min(1000 * Math.pow(2, attempt) + Math.random() * 1000, 30000);
-                    await new Promise(resolve => setTimeout(resolve, backoff));
-                    continue;
-                } else {
-                    const txt = await response.text();
-                    if (response.ok) return txt;
-                    lastError = new Error(`HTTP ${response.status}`);
-                }
-            } catch (e) {
-                lastError = e;
-                const backoff = Math.min(1000 * Math.pow(2, attempt) + Math.random() * 500, 10000);
-                await new Promise(r => setTimeout(r, backoff));
-                continue;
-            }
-        }
-        throw new Error(`Smart retry failed after ${maxRetries} attempts: ${lastError?.message}`);
-    }
-
-    // متد جدید: smartFetch - برای Workers که Response می‌خواهد
-    async smartFetch(url, init = {}, maxRetries = 3) {
-        let lastError = null;
-        for (let attempt = 0; attempt < maxRetries; attempt++) {
-            const randomHeaders = this.generateRandomHeaders();
-            const finalHeaders = new Headers(init.headers || {});
-            for (const [k, v] of Object.entries(randomHeaders)) {
-                const lower = k.toLowerCase();
-                if (['upgrade','connection','sec-websocket-key','sec-websocket-version','sec-websocket-extensions','host'].includes(lower)) continue;
-                if (!finalHeaders.has(k)) finalHeaders.set(k, v);
-            }
-            try {
-                const response = await fetch(url, {
-                    ...init,
-                    headers: finalHeaders,
-                    cf: { cacheTtl: 0, ...(init.cf || {}) }
-                });
-                this.requestTimestamps.push(Date.now());
-                if (this.requestTimestamps.length > 20) this.requestTimestamps.shift();
-                if (response.status === 429 || response.status === 503) {
-                    const backoff = Math.min(1000 * Math.pow(2, attempt) + Math.random() * 1000, 8000);
-                    await new Promise(r => setTimeout(r, backoff));
-                    continue;
-                }
-                return response;
-            } catch (e) {
-                lastError = e;
-                const backoff = Math.min(1000 * Math.pow(2, attempt) + Math.random() * 500, 5000);
-                await new Promise(r => setTimeout(r, backoff));
-                continue;
-            }
-        }
-        throw lastError || new Error('smartFetch failed');
-    }
-}
-
-// نمونه گلوبال - برای استفاده در تمام Worker
-const globalBypasser = new RateLimitBypasser();
-
 export default {
     
-    async fetch(request, env, ctx) {
-        trackRequest(env, ctx);
-        const url = new URL(request.url); // <--- فقط همین یک بار تعریف می‌شود
+	async fetch(request, env, ctx) {
+		trackRequest(env, ctx);
+		const url = new URL(request.url); // <--- فقط همین یک بار تعریف می‌شود
 
         // این بلاک را بعد از تعریف متغیر url اضافه کنید:
 if (url.pathname === "/api/init-db") {
@@ -315,107 +58,107 @@ if (url.pathname === "/api/init-db") {
         }
         
         // ✅ حالت استاندارد و بدون ارور
-        if (Router.isWebSocketUpgrade(request) && url.pathname === "/Ma_Ke_Vaslim") {
-            return await Router.handleWebSocket(request, env, ctx);
-        }
+		if (Router.isWebSocketUpgrade(request) && url.pathname === "/Ma_Ke_Vaslim") {
+			return await Router.handleWebSocket(request, env, ctx);
+		}
 
-        if (Router.isSubscriptionPath(url.pathname)) {
-            return await Router.handleSubscription(url, env);
-        }
-        if (url.pathname.startsWith("/api/") || url.pathname === "/locations") {
-            return await Router.handleApi(request, url, env, ctx);
-        }
-        if (url.pathname === "/panel" || url.pathname === "/login") {
-            return await Router.handlePanel(request, env);
-        }
-        if (url.pathname.startsWith("/status/")) {
+		if (Router.isSubscriptionPath(url.pathname)) {
+			return await Router.handleSubscription(url, env);
+		}
+		if (url.pathname.startsWith("/api/") || url.pathname === "/locations") {
+			return await Router.handleApi(request, url, env, ctx);
+		}
+		if (url.pathname === "/panel" || url.pathname === "/login") {
+			return await Router.handlePanel(request, env);
+		}
+		if (url.pathname.startsWith("/status/")) {
     return await Router.handleUserStatus(url, env, request);
 }
-        return new Response(HTML_TEMPLATES.nginx, {
-            headers: { "Content-Type": "text/html; charset=utf-8" },
-        });
-    },
+		return new Response(HTML_TEMPLATES.nginx, {
+			headers: { "Content-Type": "text/html; charset=utf-8" },
+		});
+	},
     async scheduled(_event, env, ctx) {
-        ctx.waitUntil(
-            (async () => {
-                try {
-                    await env.DB.prepare("UPDATE users SET used_req = 0").run();
-                    if (typeof USER_REQ_CACHE !== 'undefined' && USER_REQ_CACHE.clear) {
-                        USER_REQ_CACHE.clear();
-                    }
-                    if (typeof USERS_LIST_CACHE !== 'undefined') {
-                        USERS_LIST_CACHE.data = null;
-                        USERS_LIST_CACHE.lastFetch = 0;
-                    }
-                    console.log("✅ ریکوئست‌های روزانه تمامی کاربران با موفقیت ریست شد.");
-                } catch (error) {
-                    console.error("❌ خطا در ریست روزانه ریکوئست‌ها:", error);
-                }
-            })()
-        );
-    }
+		ctx.waitUntil(
+			(async () => {
+				try {
+					await env.DB.prepare("UPDATE users SET used_req = 0").run();
+					if (typeof USER_REQ_CACHE !== 'undefined' && USER_REQ_CACHE.clear) {
+						USER_REQ_CACHE.clear();
+					}
+					if (typeof USERS_LIST_CACHE !== 'undefined') {
+						USERS_LIST_CACHE.data = null;
+						USERS_LIST_CACHE.lastFetch = 0;
+					}
+					console.log("✅ ریکوئست‌های روزانه تمامی کاربران با موفقیت ریست شد.");
+				} catch (error) {
+					console.error("❌ خطا در ریست روزانه ریکوئست‌ها:", error);
+				}
+			})()
+		);
+	}
 }; // پایان بلاک export default
 const Router = {
-    isWebSocketUpgrade(request) {
-        const upgradeHeader = (request.headers.get("Upgrade") || "").toLowerCase();
-        return upgradeHeader === "websocket";
-    },
-    isSubscriptionPath(pathname) {
-        return pathname.startsWith("/sub/") || pathname.startsWith("/feed/");
-    },
-    async handleWebSocket(_request, env, ctx) {
-        try {
-            let proxyIP = "proxyip.cmliussss.net";
-            try {
-                const proxyRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'proxy_ip'").first();
-                if (proxyRow && proxyRow.value) {
-                    proxyIP = proxyRow.value;
-                }
-            } catch (e) {}
-            const mockStoredData = { proxy_ip: proxyIP };
-            return handleVLESS(env, mockStoredData, ctx);
-        } catch (e) {
-            return new Response("Internal Server Error", { status: 500 });
-        }
-    },
-    async handleSubscription(url, env) {
-        const isSubPath = url.pathname.startsWith("/sub/");
-        const offset = isSubPath ? 5 : 6;
-        let subUser = decodeURIComponent(url.pathname.slice(offset));
-        const host = url.hostname;
-        try {
-            const user = await env.DB.prepare("SELECT * FROM users WHERE username = ? OR uuid = ?").bind(subUser, subUser).first();
-            if (!user || user.connection_type !== atob("dmxlc3M=")) {
-                return new Response("Not Found", { status: 404 });
-            }
-            return await SubscriptionService.generateText(user, host);
-        } catch (err) {
-            return new Response("Error building config: " + err.message, { status: 500 });
-        }
-    },
-    async handlePanel(request, env) {
-        const hasPassword = await DbService.getPanelPassword(env.DB);
-        if (!hasPassword) {
-            return new Response(HTML_TEMPLATES.setup, {
-                headers: { "Content-Type": "text/html; charset=utf-8" },
-            });
-        }
-        const authorized = await DbService.verifyApiAuth(request, env);
-        if (!authorized) {
-            return new Response(HTML_TEMPLATES.login, {
-                headers: { "Content-Type": "text/html; charset=utf-8" },
-            });
-        }
-        return new Response(HTML_TEMPLATES.panel, {
-            headers: {
-                "Content-Type": "text/html; charset=utf-8",
-                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-                Pragma: "no-cache",
-                Expires: "0",
-            },
-        });
-    },
-    async handleUserStatus(url, env, request) {
+	isWebSocketUpgrade(request) {
+		const upgradeHeader = (request.headers.get("Upgrade") || "").toLowerCase();
+		return upgradeHeader === "websocket";
+	},
+	isSubscriptionPath(pathname) {
+		return pathname.startsWith("/sub/") || pathname.startsWith("/feed/");
+	},
+	async handleWebSocket(_request, env, ctx) {
+		try {
+			let proxyIP = "proxyip.cmliussss.net";
+			try {
+				const proxyRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'proxy_ip'").first();
+				if (proxyRow && proxyRow.value) {
+					proxyIP = proxyRow.value;
+				}
+			} catch (e) {}
+			const mockStoredData = { proxy_ip: proxyIP };
+			return handleVLESS(env, mockStoredData, ctx);
+		} catch (e) {
+			return new Response("Internal Server Error", { status: 500 });
+		}
+	},
+	async handleSubscription(url, env) {
+		const isSubPath = url.pathname.startsWith("/sub/");
+		const offset = isSubPath ? 5 : 6;
+		let subUser = decodeURIComponent(url.pathname.slice(offset));
+		const host = url.hostname;
+		try {
+			const user = await env.DB.prepare("SELECT * FROM users WHERE username = ? OR uuid = ?").bind(subUser, subUser).first();
+			if (!user || user.connection_type !== atob("dmxlc3M=")) {
+				return new Response("Not Found", { status: 404 });
+			}
+			return await SubscriptionService.generateText(user, host);
+		} catch (err) {
+			return new Response("Error building config: " + err.message, { status: 500 });
+		}
+	},
+	async handlePanel(request, env) {
+		const hasPassword = await DbService.getPanelPassword(env.DB);
+		if (!hasPassword) {
+			return new Response(HTML_TEMPLATES.setup, {
+				headers: { "Content-Type": "text/html; charset=utf-8" },
+			});
+		}
+		const authorized = await DbService.verifyApiAuth(request, env);
+		if (!authorized) {
+			return new Response(HTML_TEMPLATES.login, {
+				headers: { "Content-Type": "text/html; charset=utf-8" },
+			});
+		}
+		return new Response(HTML_TEMPLATES.panel, {
+			headers: {
+				"Content-Type": "text/html; charset=utf-8",
+				"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+				Pragma: "no-cache",
+				Expires: "0",
+			},
+		});
+	},
+	async handleUserStatus(url, env, request) {
     const username = decodeURIComponent(url.pathname.slice(8));
     if (!username) {
         return new Response("Username is required", { status: 400 });
@@ -468,352 +211,350 @@ const Router = {
     }
 },
 
-    async handleApi(request, url, env, ctx) {
-        const hasPassword = await DbService.getPanelPassword(env.DB);
-        if (url.pathname === "/api/setup-password" && request.method === "POST") {
-            if (hasPassword) {
-                return new Response(JSON.stringify({ error: "رمز عبور از قبل تعریف شده است" }), {
-                    status: 400,
-                    headers: { "Content-Type": "application/json; charset=utf-8" },
-                });
-            }
-            const { password } = await request.json();
-            if (!password || password.length < 4) {
-                return new Response(JSON.stringify({ error: "رمز عبور باید حداقل ۴ کاراکتر باشد" }), {
-                    status: 400,
-                    headers: { "Content-Type": "application/json; charset=utf-8" },
-                });
-            }
-            const hashed = await DbService.sha256(password);
-            await DbService.setPanelPassword(env.DB, hashed);
-            return new Response(JSON.stringify({ success: true }), {
-                headers: {
-                    "Content-Type": "application/json; charset=utf-8",
-                    "Set-Cookie": "panel_session=" + hashed + "; Path=/; HttpOnly; Secure; SameSite=Lax",
-                },
-            });
-        }
-        if (url.pathname === "/api/login" && request.method === "POST") {
-            const { password } = await request.json();
-            const hashedInput = await DbService.sha256(password);
-            const storedHash = await DbService.getPanelPassword(env.DB);
-            if (storedHash === hashedInput) {
-                return new Response(JSON.stringify({ success: true }), {
-                    headers: {
-                        "Content-Type": "application/json; charset=utf-8",
-                        "Set-Cookie": "panel_session=" + storedHash + "; Path=/; HttpOnly; Secure; SameSite=Lax",
-                    },
-                });
-            }
-            return new Response(JSON.stringify({ error: "رمز عبور اشتباه است" }), {
-                status: 401,
-                headers: { "Content-Type": "application/json; charset=utf-8" },
-            });
-        }
-        if (url.pathname === "/api/logout" && request.method === "POST") {
-            return new Response(JSON.stringify({ success: true }), {
-                headers: {
-                    "Content-Type": "application/json; charset=utf-8",
-                    "Set-Cookie": "panel_session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; Secure; SameSite=Lax",
-                },
-            });
-        }
-        const authorized = await DbService.verifyApiAuth(request, env);
-        if (!authorized) {
-            return new Response(JSON.stringify({ error: "Unauthorized" }), {
-                status: 401,
-                headers: { "Content-Type": "application/json; charset=utf-8" },
-            });
-        }
-        if (url.pathname === "/api/update-panel" && request.method === "POST") {
-            if (!env.CF_API_TOKEN || !env.CF_ACCOUNT_ID) {
-                return new Response(JSON.stringify({ error: "توکن یا اکانت آیدی کلودفلر تنظیم نشده است. لطفا با سایت زیر اپدیت کنید " }), { status: 400, headers: { "Content-Type": "application/json" } });
-            }
-            try {
-                const githubRes = await fetch("" + Date.now() + Math.random(), {
-                    headers: {
-                        "Cache-Control": "no-cache, no-store, must-revalidate",
-                        Pragma: "no-cache",
-                        Expires: "0",
-                    },
-                });
-                if (!githubRes.ok) throw new Error("خطا در دریافت سورس جدید از گیت‌هاب");
-                const newCode = await githubRes.text();
-                const scriptName = env.WORKER_NAME || url.hostname.split(".")[0];
-                const bindingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/workers/scripts/${scriptName}/bindings`, {
-                    headers: { Authorization: "Bearer " + env.CF_API_TOKEN },
-                });
-                const bindingsData = await bindingsRes.json();
-                if (!bindingsData.success) throw new Error("عدم دسترسی به تنظیمات ورکر. توکن نامعتبر است.");
-                const newBindings = [];
-                for (const b of bindingsData.result) {
-                    if (b.type === "d1") {
-                        newBindings.push({ type: "d1", name: b.name, id: b.database_id || b.id });
-                    } else if (b.name === "CF_API_TOKEN") {
-                        newBindings.push({ type: "secret_text", name: "CF_API_TOKEN", text: env.CF_API_TOKEN });
-                    } else if (b.name === "CF_ACCOUNT_ID") {
-                        newBindings.push({ type: "secret_text", name: "CF_ACCOUNT_ID", text: env.CF_ACCOUNT_ID });
-                    }
-                }
-                const metadata = {
-                    main_module: "mkvasl.js",
-                    compatibility_date: "2024-02-08",
-                    bindings: newBindings,
-                };
-                const formData = new FormData();
-                formData.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
-                formData.append("mkvasl.js", new Blob([newCode], { type: "application/javascript+module" }), "mkvasl.js");
-                const deployRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/workers/scripts/${scriptName}`, {
-                    method: "PUT",
-                    headers: { Authorization: "Bearer " + env.CF_API_TOKEN },
-                    body: formData,
-                });
-                const deployData = await deployRes.json();
-                if (!deployData.success) throw new Error("خطا در اعمال آپدیت در کلودفلر.");
-                return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-            } catch (err) {
-                const errorMsg = err.message + " | در صورت عدم موفقیت، از طریق لینک زیر آپدیت کنید: ";
-                return new Response(JSON.stringify({ error: errorMsg }), { status: 500, headers: { "Content-Type": "application/json" } });
-            }
-        }
-        if (url.pathname === "/api/change-password" && request.method === "POST") {
-            const { current_password, new_password } = await request.json();
-            if (!current_password || !new_password) {
-                return new Response(JSON.stringify({ error: "رمز عبور فعلی و جدید الزامی هستند" }), {
-                    status: 400,
-                    headers: { "Content-Type": "application/json; charset=utf-8" },
-                });
-            }
-            const currentHash = await DbService.sha256(current_password);
-            const storedHash = await DbService.getPanelPassword(env.DB);
-            if (storedHash && storedHash !== currentHash) {
-                return new Response(JSON.stringify({ error: "رمز عبور فعلی اشتباه است" }), {
-                    status: 401,
-                    headers: { "Content-Type": "application/json; charset=utf-8" },
-                });
-            }
-            if (new_password.length < 4) {
-                return new Response(JSON.stringify({ error: "رمز عبور جدید باید حداقل ۴ کاراکتر باشد" }), {
-                    status: 400,
-                    headers: { "Content-Type": "application/json; charset=utf-8" },
-                });
-            }
-            const newHash = await DbService.sha256(new_password);
-            await DbService.setPanelPassword(env.DB, newHash);
-            return new Response(JSON.stringify({ success: true }), {
-                headers: {
-                    "Content-Type": "application/json; charset=utf-8",
-                    "Set-Cookie": "panel_session=" + newHash + "; Path=/; HttpOnly; Secure; SameSite=Lax",
-                },
-            });
-        }
-        if (url.pathname === "/locations") {
-            try {
-                const response = await (typeof globalBypasser !== 'undefined' ? globalBypasser.smartFetch("https://speed.cloudflare.com/locations", {
-                    headers: { Referer: "https://speed.cloudflare.com/" },
-                }, 3) : fetch("https://speed.cloudflare.com/locations", {
-                    headers: { Referer: "https://speed.cloudflare.com/" },
-                }));
-                const data = await response.json();
-                return new Response(JSON.stringify(data), {
-                    headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" },
-                });
-            } catch (e) {
-                return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: { "Content-Type": "application/json" } });
-            }
-        }
-        if (url.pathname === "/api/proxy-ip") {
-            if (request.method === "POST") {
-                const { proxy_ip, iata, frag_len, frag_int } = await request.json();
-                if (proxy_ip) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('proxy_ip', ?)").bind(proxy_ip).run();
-                if (iata !== undefined) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('proxy_location_iata', ?)").bind(iata).run();
-                if (frag_len !== undefined) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('frag_len', ?)").bind(frag_len).run();
-                if (frag_int !== undefined) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('frag_int', ?)").bind(frag_int).run();
-                return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-            }
-            if (request.method === "GET") {
-                const rowIp = await env.DB.prepare("SELECT value FROM settings WHERE key = 'proxy_ip'").first();
-                const rowIata = await env.DB.prepare("SELECT value FROM settings WHERE key = 'proxy_location_iata'").first();
-                const rowLen = await env.DB.prepare("SELECT value FROM settings WHERE key = 'frag_len'").first();
-                const rowInt = await env.DB.prepare("SELECT value FROM settings WHERE key = 'frag_int'").first();
-                return new Response(
-                    JSON.stringify({
-                        proxy_ip: rowIp ? rowIp.value : "proxyip.cmliussss.net",
-                        iata: rowIata ? rowIata.value : "",
-                        frag_len: rowLen ? rowLen.value : "20-30",
-                        frag_int: rowInt ? rowInt.value : "1-2",
-                    }),
-                    { headers: { "Content-Type": "application/json" } }
-                );
-            }
-        }
-        if (url.pathname.startsWith("/api/users")) {
-            const pathParts = url.pathname.split("/");
-            const isUserAction = pathParts.length > 3;
-            if (isUserAction) {
-                const username = decodeURIComponent(pathParts.pop());
-                if (request.method === "PUT") {
-                    const body = await request.json();
-                    if (body.toggle_only !== undefined) {
-                        await env.DB.prepare("UPDATE users SET is_active = CASE WHEN is_active = 1 THEN 0 ELSE 1 END WHERE username = ?").bind(username).run();
-                        // بعد از تغییر کاربر، کش لیست کاربران را منقضی می‌کنیم تا اطلاعات سریع بروز شوند
-                        USERS_LIST_CACHE.data = null;
+	async handleApi(request, url, env, ctx) {
+		const hasPassword = await DbService.getPanelPassword(env.DB);
+		if (url.pathname === "/api/setup-password" && request.method === "POST") {
+			if (hasPassword) {
+				return new Response(JSON.stringify({ error: "رمز عبور از قبل تعریف شده است" }), {
+					status: 400,
+					headers: { "Content-Type": "application/json; charset=utf-8" },
+				});
+			}
+			const { password } = await request.json();
+			if (!password || password.length < 4) {
+				return new Response(JSON.stringify({ error: "رمز عبور باید حداقل ۴ کاراکتر باشد" }), {
+					status: 400,
+					headers: { "Content-Type": "application/json; charset=utf-8" },
+				});
+			}
+			const hashed = await DbService.sha256(password);
+			await DbService.setPanelPassword(env.DB, hashed);
+			return new Response(JSON.stringify({ success: true }), {
+				headers: {
+					"Content-Type": "application/json; charset=utf-8",
+					"Set-Cookie": "panel_session=" + hashed + "; Path=/; HttpOnly; Secure; SameSite=Lax",
+				},
+			});
+		}
+		if (url.pathname === "/api/login" && request.method === "POST") {
+			const { password } = await request.json();
+			const hashedInput = await DbService.sha256(password);
+			const storedHash = await DbService.getPanelPassword(env.DB);
+			if (storedHash === hashedInput) {
+				return new Response(JSON.stringify({ success: true }), {
+					headers: {
+						"Content-Type": "application/json; charset=utf-8",
+						"Set-Cookie": "panel_session=" + storedHash + "; Path=/; HttpOnly; Secure; SameSite=Lax",
+					},
+				});
+			}
+			return new Response(JSON.stringify({ error: "رمز عبور اشتباه است" }), {
+				status: 401,
+				headers: { "Content-Type": "application/json; charset=utf-8" },
+			});
+		}
+		if (url.pathname === "/api/logout" && request.method === "POST") {
+			return new Response(JSON.stringify({ success: true }), {
+				headers: {
+					"Content-Type": "application/json; charset=utf-8",
+					"Set-Cookie": "panel_session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; Secure; SameSite=Lax",
+				},
+			});
+		}
+		const authorized = await DbService.verifyApiAuth(request, env);
+		if (!authorized) {
+			return new Response(JSON.stringify({ error: "Unauthorized" }), {
+				status: 401,
+				headers: { "Content-Type": "application/json; charset=utf-8" },
+			});
+		}
+		if (url.pathname === "/api/update-panel" && request.method === "POST") {
+			if (!env.CF_API_TOKEN || !env.CF_ACCOUNT_ID) {
+				return new Response(JSON.stringify({ error: "توکن یا اکانت آیدی کلودفلر تنظیم نشده است. لطفا با سایت زیر اپدیت کنید https://zeus-panel.ir-netlify.workers.dev/" }), { status: 400, headers: { "Content-Type": "application/json" } });
+			}
+			try {
+				const githubRes = await fetch("https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/zeus.js?t=" + Date.now() + Math.random(), {
+					headers: {
+						"Cache-Control": "no-cache, no-store, must-revalidate",
+						Pragma: "no-cache",
+						Expires: "0",
+					},
+				});
+				if (!githubRes.ok) throw new Error("خطا در دریافت سورس جدید از گیت‌هاب");
+				const newCode = await githubRes.text();
+				const scriptName = env.WORKER_NAME || url.hostname.split(".")[0];
+				const bindingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/workers/scripts/${scriptName}/bindings`, {
+					headers: { Authorization: "Bearer " + env.CF_API_TOKEN },
+				});
+				const bindingsData = await bindingsRes.json();
+				if (!bindingsData.success) throw new Error("عدم دسترسی به تنظیمات ورکر. توکن نامعتبر است.");
+				const newBindings = [];
+				for (const b of bindingsData.result) {
+					if (b.type === "d1") {
+						newBindings.push({ type: "d1", name: b.name, id: b.database_id || b.id });
+					} else if (b.name === "CF_API_TOKEN") {
+						newBindings.push({ type: "secret_text", name: "CF_API_TOKEN", text: env.CF_API_TOKEN });
+					} else if (b.name === "CF_ACCOUNT_ID") {
+						newBindings.push({ type: "secret_text", name: "CF_ACCOUNT_ID", text: env.CF_ACCOUNT_ID });
+					}
+				}
+				const metadata = {
+					main_module: "zeus.js",
+					compatibility_date: "2024-02-08",
+					bindings: newBindings,
+				};
+				const formData = new FormData();
+				formData.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
+				formData.append("zeus.js", new Blob([newCode], { type: "application/javascript+module" }), "zeus.js");
+				const deployRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/workers/scripts/${scriptName}`, {
+					method: "PUT",
+					headers: { Authorization: "Bearer " + env.CF_API_TOKEN },
+					body: formData,
+				});
+				const deployData = await deployRes.json();
+				if (!deployData.success) throw new Error("خطا در اعمال آپدیت در کلودفلر.");
+				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+			} catch (err) {
+				const errorMsg = err.message + " | در صورت عدم موفقیت، از طریق لینک زیر آپدیت کنید: https://zeus-panel.ir-netlify.workers.dev/";
+				return new Response(JSON.stringify({ error: errorMsg }), { status: 500, headers: { "Content-Type": "application/json" } });
+			}
+		}
+		if (url.pathname === "/api/change-password" && request.method === "POST") {
+			const { current_password, new_password } = await request.json();
+			if (!current_password || !new_password) {
+				return new Response(JSON.stringify({ error: "رمز عبور فعلی و جدید الزامی هستند" }), {
+					status: 400,
+					headers: { "Content-Type": "application/json; charset=utf-8" },
+				});
+			}
+			const currentHash = await DbService.sha256(current_password);
+			const storedHash = await DbService.getPanelPassword(env.DB);
+			if (storedHash && storedHash !== currentHash) {
+				return new Response(JSON.stringify({ error: "رمز عبور فعلی اشتباه است" }), {
+					status: 401,
+					headers: { "Content-Type": "application/json; charset=utf-8" },
+				});
+			}
+			if (new_password.length < 4) {
+				return new Response(JSON.stringify({ error: "رمز عبور جدید باید حداقل ۴ کاراکتر باشد" }), {
+					status: 400,
+					headers: { "Content-Type": "application/json; charset=utf-8" },
+				});
+			}
+			const newHash = await DbService.sha256(new_password);
+			await DbService.setPanelPassword(env.DB, newHash);
+			return new Response(JSON.stringify({ success: true }), {
+				headers: {
+					"Content-Type": "application/json; charset=utf-8",
+					"Set-Cookie": "panel_session=" + newHash + "; Path=/; HttpOnly; Secure; SameSite=Lax",
+				},
+			});
+		}
+		if (url.pathname === "/locations") {
+			try {
+				const response = await fetch("https://speed.cloudflare.com/locations", {
+					headers: { Referer: "https://speed.cloudflare.com/" },
+				});
+				const data = await response.json();
+				return new Response(JSON.stringify(data), {
+					headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" },
+				});
+			} catch (e) {
+				return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: { "Content-Type": "application/json" } });
+			}
+		}
+		if (url.pathname === "/api/proxy-ip") {
+			if (request.method === "POST") {
+				const { proxy_ip, iata, frag_len, frag_int } = await request.json();
+				if (proxy_ip) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('proxy_ip', ?)").bind(proxy_ip).run();
+				if (iata !== undefined) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('proxy_location_iata', ?)").bind(iata).run();
+				if (frag_len !== undefined) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('frag_len', ?)").bind(frag_len).run();
+				if (frag_int !== undefined) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('frag_int', ?)").bind(frag_int).run();
+				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+			}
+			if (request.method === "GET") {
+				const rowIp = await env.DB.prepare("SELECT value FROM settings WHERE key = 'proxy_ip'").first();
+				const rowIata = await env.DB.prepare("SELECT value FROM settings WHERE key = 'proxy_location_iata'").first();
+				const rowLen = await env.DB.prepare("SELECT value FROM settings WHERE key = 'frag_len'").first();
+				const rowInt = await env.DB.prepare("SELECT value FROM settings WHERE key = 'frag_int'").first();
+				return new Response(
+					JSON.stringify({
+						proxy_ip: rowIp ? rowIp.value : "proxyip.cmliussss.net",
+						iata: rowIata ? rowIata.value : "",
+						frag_len: rowLen ? rowLen.value : "20-30",
+						frag_int: rowInt ? rowInt.value : "1-2",
+					}),
+					{ headers: { "Content-Type": "application/json" } }
+				);
+			}
+		}
+		if (url.pathname.startsWith("/api/users")) {
+			const pathParts = url.pathname.split("/");
+			const isUserAction = pathParts.length > 3;
+			if (isUserAction) {
+				const username = decodeURIComponent(pathParts.pop());
+				if (request.method === "PUT") {
+					const body = await request.json();
+					if (body.toggle_only !== undefined) {
+						await env.DB.prepare("UPDATE users SET is_active = CASE WHEN is_active = 1 THEN 0 ELSE 1 END WHERE username = ?").bind(username).run();
+						// بعد از تغییر کاربر، کش لیست کاربران را منقضی می‌کنیم تا اطلاعات سریع بروز شوند
+						USERS_LIST_CACHE.data = null;
 USERS_LIST_CACHE.lastFetch = 0;
-                        return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-                    } else if (body.reset_action !== undefined) {
-                        if (body.reset_action === "volume") {
-                            await env.DB.prepare("UPDATE users SET used_gb = 0 WHERE username = ?").bind(username).run();
-                            GLOBAL_TRAFFIC_CACHE.set(username, 0);
-                        } else if (body.reset_action === "req") {
-                            await env.DB.prepare("UPDATE users SET used_req = 0 WHERE username = ?").bind(username).run();
-                            USER_REQ_CACHE.set(username, 0);
-                        } else if (body.reset_action === "time") {
-                            await env.DB.prepare("UPDATE users SET created_at = CURRENT_TIMESTAMP WHERE username = ?").bind(username).run();
-                        }
-                        USERS_LIST_CACHE.data = null;
+						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+					} else if (body.reset_action !== undefined) {
+						if (body.reset_action === "volume") {
+							await env.DB.prepare("UPDATE users SET used_gb = 0 WHERE username = ?").bind(username).run();
+							GLOBAL_TRAFFIC_CACHE.set(username, 0);
+						} else if (body.reset_action === "req") {
+							await env.DB.prepare("UPDATE users SET used_req = 0 WHERE username = ?").bind(username).run();
+							USER_REQ_CACHE.set(username, 0);
+						} else if (body.reset_action === "time") {
+							await env.DB.prepare("UPDATE users SET created_at = CURRENT_TIMESTAMP WHERE username = ?").bind(username).run();
+						}
+						USERS_LIST_CACHE.data = null;
 USERS_LIST_CACHE.lastFetch = 0;
-                        return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-                    } else {
-                        const { username: new_username, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, max_connections } = body;
-                        if (new_username && new_username !== username) {
-                            const existing = await env.DB.prepare("SELECT id FROM users WHERE username = ?").bind(new_username).first();
-                            if (existing) {
-                                return new Response(JSON.stringify({ error: "این نام کاربری از قبل وجود دارد" }), { status: 400, headers: { "Content-Type": "application/json" } });
-                            }
-                            if (GLOBAL_TRAFFIC_CACHE.has(username)) {
-                                GLOBAL_TRAFFIC_CACHE.set(new_username, GLOBAL_TRAFFIC_CACHE.get(username));
-                                GLOBAL_TRAFFIC_CACHE.delete(username);
-                            }
-                            if (USER_REQ_CACHE.has(username)) {
-                                USER_REQ_CACHE.set(new_username, USER_REQ_CACHE.get(username));
-                                USER_REQ_CACHE.delete(username);
-                            }
-                            if (ACTIVE_CONNECTIONS_COUNT.has(username)) {
-                                ACTIVE_CONNECTIONS_COUNT.set(new_username, ACTIVE_CONNECTIONS_COUNT.get(username));
-                                ACTIVE_CONNECTIONS_COUNT.delete(username);
-                            }
-                            if (GLOBAL_LAST_ACTIVE_WRITE.has(username)) {
-                                GLOBAL_LAST_ACTIVE_WRITE.set(new_username, GLOBAL_LAST_ACTIVE_WRITE.get(username));
-                                GLOBAL_LAST_ACTIVE_WRITE.delete(username);
-                            }
-                        }
-                        await env.DB.prepare("UPDATE users SET username = ?, limit_gb = ?, expiry_days = ?, limit_req = ?, ips = ?, tls = ?, port = ?, fingerprint = ?, max_connections = ? WHERE username = ?")
-                            .bind(new_username || username, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, tls, port, fingerprint || "chrome", max_connections ? parseInt(max_connections) : null, username)
-                            .run();
-                        USERS_LIST_CACHE.data = null;
+						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+					} else {
+						const { username: new_username, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, max_connections } = body;
+						if (new_username && new_username !== username) {
+							const existing = await env.DB.prepare("SELECT id FROM users WHERE username = ?").bind(new_username).first();
+							if (existing) {
+								return new Response(JSON.stringify({ error: "این نام کاربری از قبل وجود دارد" }), { status: 400, headers: { "Content-Type": "application/json" } });
+							}
+							if (GLOBAL_TRAFFIC_CACHE.has(username)) {
+								GLOBAL_TRAFFIC_CACHE.set(new_username, GLOBAL_TRAFFIC_CACHE.get(username));
+								GLOBAL_TRAFFIC_CACHE.delete(username);
+							}
+							if (USER_REQ_CACHE.has(username)) {
+								USER_REQ_CACHE.set(new_username, USER_REQ_CACHE.get(username));
+								USER_REQ_CACHE.delete(username);
+							}
+							if (ACTIVE_CONNECTIONS_COUNT.has(username)) {
+								ACTIVE_CONNECTIONS_COUNT.set(new_username, ACTIVE_CONNECTIONS_COUNT.get(username));
+								ACTIVE_CONNECTIONS_COUNT.delete(username);
+							}
+							if (GLOBAL_LAST_ACTIVE_WRITE.has(username)) {
+								GLOBAL_LAST_ACTIVE_WRITE.set(new_username, GLOBAL_LAST_ACTIVE_WRITE.get(username));
+								GLOBAL_LAST_ACTIVE_WRITE.delete(username);
+							}
+						}
+						await env.DB.prepare("UPDATE users SET username = ?, limit_gb = ?, expiry_days = ?, limit_req = ?, ips = ?, tls = ?, port = ?, fingerprint = ?, max_connections = ? WHERE username = ?")
+							.bind(new_username || username, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, tls, port, fingerprint || "chrome", max_connections ? parseInt(max_connections) : null, username)
+							.run();
+						USERS_LIST_CACHE.data = null;
 USERS_LIST_CACHE.lastFetch = 0;
-                        return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-                    }
-                }
-                if (request.method === "DELETE") {
-                    await env.DB.prepare("DELETE FROM users WHERE username = ?").bind(username).run();
-                    USERS_LIST_CACHE.data = null;
+						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+					}
+				}
+				if (request.method === "DELETE") {
+					await env.DB.prepare("DELETE FROM users WHERE username = ?").bind(username).run();
+					USERS_LIST_CACHE.data = null;
 USERS_LIST_CACHE.lastFetch = 0;
-                    return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-                }
-            } else {
-                if (request.method === "GET") {
-                    const now = Date.now();
-                    // اعمال درست سیستم کش ۳۰ ثانیه‌ای در مسیر لود کاربران پنل زئوس
-                    if (USERS_LIST_CACHE.data && (now - USERS_LIST_CACHE.lastFetch < 30000)) {
-                        return new Response(USERS_LIST_CACHE.data, {
-                            headers: {
-                                "Content-Type": "application/json; charset=utf-8",
-                                "Cache-Control": "max-age=30"
-                            },
-                        });
-                    }
+					return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+				}
+			} else {
+				if (request.method === "GET") {
+					const now = Date.now();
+					// اعمال درست سیستم کش ۳۰ ثانیه‌ای در مسیر لود کاربران پنل زئوس
+					if (USERS_LIST_CACHE.data && (now - USERS_LIST_CACHE.lastFetch < 30000)) {
+						return new Response(USERS_LIST_CACHE.data, {
+							headers: {
+								"Content-Type": "application/json; charset=utf-8",
+								"Cache-Control": "max-age=30"
+							},
+						});
+					}
 
-                    try {
-                        await flushExpiredTraffic(env);
-                    } catch (e) {}
-                    const { results } = await env.DB.prepare("SELECT * FROM users ORDER BY id DESC").all();
-                    const enrichedUsers = (results || []).map((user) => ({
-                        ...user,
-                        is_online: user.last_active && now - user.last_active < 65000 ? 1 : 0,
-                        online_count: ACTIVE_CONNECTIONS_COUNT.get(user.username) || 0,
-                    }));
-                    let cfReqs = { today: 0, total: 0 };
-                    try {
-                        const liveCf = await getCfUsage(env);
-                        const todayStr = new Date().toISOString().split("T")[0];
-                        const dateRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'req_last_date'").first();
-                        const totalRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'req_total'").first();
-                        let dbTotal = totalRow ? parseInt(totalRow.value) || 0 : 0;
-                        let dbToday = 0;
-                        if (dateRow && dateRow.value === todayStr) {
-                            const todayRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'req_today'").first();
-                            dbToday = todayRow ? parseInt(todayRow.value) || 0 : 0;
-                        }
-                        if (liveCf.today > dbToday) {
-                            dbToday = liveCf.today;
-                            await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(dbToday), String(dbToday)).run();
-                            await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_last_date', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(todayStr, todayStr).run();
-                        }
-                        if (liveCf.total > dbTotal) {
-                            dbTotal = liveCf.total;
-                            await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_total', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(dbTotal), String(dbTotal)).run();
-                        }
-                        cfReqs.today = dbToday + GLOBAL_REQ_COUNT;
-                        cfReqs.total = dbTotal + GLOBAL_REQ_COUNT;
-                    } catch (e) {}
+					try {
+						await flushExpiredTraffic(env);
+					} catch (e) {}
+					const { results } = await env.DB.prepare("SELECT * FROM users ORDER BY id DESC").all();
+					const enrichedUsers = (results || []).map((user) => ({
+						...user,
+						is_online: user.last_active && now - user.last_active < 65000 ? 1 : 0,
+						online_count: ACTIVE_CONNECTIONS_COUNT.get(user.username) || 0,
+					}));
+					let cfReqs = { today: 0, total: 0 };
+					try {
+						const liveCf = await getCfUsage(env);
+						const todayStr = new Date().toISOString().split("T")[0];
+						const dateRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'req_last_date'").first();
+						const totalRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'req_total'").first();
+						let dbTotal = totalRow ? parseInt(totalRow.value) || 0 : 0;
+						let dbToday = 0;
+						if (dateRow && dateRow.value === todayStr) {
+							const todayRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'req_today'").first();
+							dbToday = todayRow ? parseInt(todayRow.value) || 0 : 0;
+						}
+						if (liveCf.today > dbToday) {
+							dbToday = liveCf.today;
+							await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(dbToday), String(dbToday)).run();
+							await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_last_date', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(todayStr, todayStr).run();
+						}
+						if (liveCf.total > dbTotal) {
+							dbTotal = liveCf.total;
+							await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_total', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(dbTotal), String(dbTotal)).run();
+						}
+						cfReqs.today = dbToday + GLOBAL_REQ_COUNT;
+						cfReqs.total = dbTotal + GLOBAL_REQ_COUNT;
+					} catch (e) {}
 
-                    const finalResponseData = JSON.stringify({
-                        users: enrichedUsers,
-                        serverTime: now,
-                        cfRequestsToday: cfReqs.today,
-                        cfRequestsTotal: cfReqs.total,
-                    });
+					const finalResponseData = JSON.stringify({
+						users: enrichedUsers,
+						serverTime: now,
+						cfRequestsToday: cfReqs.today,
+						cfRequestsTotal: cfReqs.total,
+					});
 
-                    // ذخیره در کش
-                    USERS_LIST_CACHE.data = finalResponseData;
-                    USERS_LIST_CACHE.lastFetch = now;
+					// ذخیره در کش
+					USERS_LIST_CACHE.data = finalResponseData;
+					USERS_LIST_CACHE.lastFetch = now;
 
-                    return new Response(finalResponseData, {
-                        headers: {
-                            "Content-Type": "application/json; charset=utf-8",
-                            "Cache-Control": "max-age=30",
-                        },
-                    });
-                }
-                if (request.method === "POST") {
-                    const { username, uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, max_connections, used_gb, used_req, created_at, is_active } = await request.json();
-                    if (!username) {
-                        return new Response(JSON.stringify({ error: "نام کاربری اجباری است" }), { status: 400, headers: { "Content-Type": "application/json" } });
-                    }
-                    const finalUuid = uuid || crypto.randomUUID();
-                    const parsedUsedGb = parseFloat(used_gb);
-                    const finalUsedGb = !isNaN(parsedUsedGb) ? parsedUsedGb : 0;
-                    const parsedUsedReq = parseInt(used_req);
-                    const finalUsedReq = !isNaN(parsedUsedReq) ? parsedUsedReq : 0;
-                    const finalCreatedAt = created_at || new Date().toISOString();
-                    const parsedIsActive = parseInt(is_active);
-                    const finalIsActive = !isNaN(parsedIsActive) ? parsedIsActive : 1;
-                    try {
-                        await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, used_gb, used_req, created_at, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-                            .bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, atob("dmxlc3M="), tls, port, fingerprint || "chrome", max_connections ? parseInt(max_connections) : null, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive)
-                            .run();
-                        USERS_LIST_CACHE.data = null;
+					return new Response(finalResponseData, {
+						headers: {
+							"Content-Type": "application/json; charset=utf-8",
+							"Cache-Control": "max-age=30",
+						},
+					});
+				}
+				if (request.method === "POST") {
+					const { username, uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, max_connections, used_gb, used_req, created_at, is_active } = await request.json();
+					if (!username) {
+						return new Response(JSON.stringify({ error: "نام کاربری اجباری است" }), { status: 400, headers: { "Content-Type": "application/json" } });
+					}
+					const finalUuid = uuid || crypto.randomUUID();
+					const parsedUsedGb = parseFloat(used_gb);
+					const finalUsedGb = !isNaN(parsedUsedGb) ? parsedUsedGb : 0;
+					const parsedUsedReq = parseInt(used_req);
+					const finalUsedReq = !isNaN(parsedUsedReq) ? parsedUsedReq : 0;
+					const finalCreatedAt = created_at || new Date().toISOString();
+					const parsedIsActive = parseInt(is_active);
+					const finalIsActive = !isNaN(parsedIsActive) ? parsedIsActive : 1;
+					try {
+						await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, used_gb, used_req, created_at, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, atob("dmxlc3M="), tls, port, fingerprint || "chrome", max_connections ? parseInt(max_connections) : null, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive)
+							.run();
+						USERS_LIST_CACHE.data = null;
 USERS_LIST_CACHE.lastFetch = 0;
-                        return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-                    } catch (err) {
-                        return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { "Content-Type": "application/json" } });
-                    }
-                }
-            }
-        }
-        return new Response(JSON.stringify({ error: "Not Found" }), { status: 404, headers: { "Content-Type": "application/json" } });
-    },
+						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+					} catch (err) {
+						return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { "Content-Type": "application/json" } });
+					}
+				}
+			}
+		}
+		return new Response(JSON.stringify({ error: "Not Found" }), { status: 404, headers: { "Content-Type": "application/json" } });
+	},
 };
 let schemaEnsured = false;
 let cachedPanelPassword = null;
 const DbService = {
-    async ensureSchema(db) {
-        if (schemaEnsured) return;
-        try {
-            await db
-                .prepare(
-                    `
+	async ensureSchema(db) {
+		if (schemaEnsured) return;
+		try {
+			await db
+				.prepare(
+					`
         CREATE TABLE IF NOT EXISTS users (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           username TEXT UNIQUE,
@@ -830,66 +571,66 @@ const DbService = {
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
       `,
-                )
-                .run();
-        } catch (e) {}
-        try {
-            await db.prepare("ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1").run();
-        } catch (e) {}
-        try {
-            await db.prepare("ALTER TABLE users ADD COLUMN last_active INTEGER").run();
-        } catch (e) {}
-        try {
-            await db.prepare("ALTER TABLE users ADD COLUMN fingerprint TEXT DEFAULT 'chrome'").run();
-        } catch (e) {}
-        try {
-            await db.prepare("ALTER TABLE users ADD COLUMN max_connections INTEGER").run();
-        } catch (e) {}
-        try {
-            await db.prepare("ALTER TABLE users ADD COLUMN limit_req INTEGER").run();
-        } catch (e) {}
-        try {
-            await db.prepare("ALTER TABLE users ADD COLUMN used_req INTEGER DEFAULT 0").run();
-        } catch (e) {}
-        try {
-            await db.prepare("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)").run();
-        } catch (e) {}
-        schemaEnsured = true;
-    },
-    async getPanelPassword(db) {
-        if (cachedPanelPassword !== null) return cachedPanelPassword;
-        try {
-            const row = await db.prepare("SELECT value FROM settings WHERE key = 'panel_password'").first();
-            cachedPanelPassword = row ? row.value : "";
-            return cachedPanelPassword || null;
-        } catch (e) {
-            return null;
-        }
-    },
-    async setPanelPassword(db, password) {
-        await db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('panel_password', ?)").bind(password).run();
-        cachedPanelPassword = password;
-    },
-    async verifyApiAuth(request, env) {
-        const storedPasswordHash = await this.getPanelPassword(env.DB);
-        if (!storedPasswordHash) return true;
-        const cookies = request.headers.get("Cookie") || "";
-        const sessionCookie = cookies.split(";").find((c) => c.trim().startsWith("panel_session="));
-        if (!sessionCookie) return false;
-        const sessionToken = sessionCookie.split("=")[1].trim();
-        return sessionToken === storedPasswordHash;
-    },
-    async sha256(message) {
-        const msgBuffer = new TextEncoder().encode(message);
-        const hashBuffer = await crypto.subtle.digest("SHA-256", msgBuffer);
-        const hashArray = Array.from(new Uint8Array(hashBuffer));
-        return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
-    },
+				)
+				.run();
+		} catch (e) {}
+		try {
+			await db.prepare("ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1").run();
+		} catch (e) {}
+		try {
+			await db.prepare("ALTER TABLE users ADD COLUMN last_active INTEGER").run();
+		} catch (e) {}
+		try {
+			await db.prepare("ALTER TABLE users ADD COLUMN fingerprint TEXT DEFAULT 'chrome'").run();
+		} catch (e) {}
+		try {
+			await db.prepare("ALTER TABLE users ADD COLUMN max_connections INTEGER").run();
+		} catch (e) {}
+		try {
+			await db.prepare("ALTER TABLE users ADD COLUMN limit_req INTEGER").run();
+		} catch (e) {}
+		try {
+			await db.prepare("ALTER TABLE users ADD COLUMN used_req INTEGER DEFAULT 0").run();
+		} catch (e) {}
+		try {
+			await db.prepare("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)").run();
+		} catch (e) {}
+		schemaEnsured = true;
+	},
+	async getPanelPassword(db) {
+		if (cachedPanelPassword !== null) return cachedPanelPassword;
+		try {
+			const row = await db.prepare("SELECT value FROM settings WHERE key = 'panel_password'").first();
+			cachedPanelPassword = row ? row.value : "";
+			return cachedPanelPassword || null;
+		} catch (e) {
+			return null;
+		}
+	},
+	async setPanelPassword(db, password) {
+		await db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('panel_password', ?)").bind(password).run();
+		cachedPanelPassword = password;
+	},
+	async verifyApiAuth(request, env) {
+		const storedPasswordHash = await this.getPanelPassword(env.DB);
+		if (!storedPasswordHash) return true;
+		const cookies = request.headers.get("Cookie") || "";
+		const sessionCookie = cookies.split(";").find((c) => c.trim().startsWith("panel_session="));
+		if (!sessionCookie) return false;
+		const sessionToken = sessionCookie.split("=")[1].trim();
+		return sessionToken === storedPasswordHash;
+	},
+	async sha256(message) {
+		const msgBuffer = new TextEncoder().encode(message);
+		const hashBuffer = await crypto.subtle.digest("SHA-256", msgBuffer);
+		const hashArray = Array.from(new Uint8Array(hashBuffer));
+		return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+	},
 };
 const SubscriptionService = {
     async generateText(user, host) {
         // ۱. دامین فیلتر شده (اگر واقعاً می‌خواهید SNI متفاوت باشد، در بخش params در پایین از آن استفاده کنید)
-        const mySecretDomain = "mkvasl.mkvsl.workers.dev"; 
+        const mySecretDomain = "mkvaslim.mkvasli.workers.dev"; 
 
         const rawIpList = [
             "add555.musicalls.ir:443#A🇹🇷",
@@ -1024,414 +765,414 @@ const SubscriptionService = {
 };
             
 async function flushExpiredTraffic(env) {
-    const now = Date.now();
-    for (const [uname, cachedBytes] of GLOBAL_TRAFFIC_CACHE.entries()) {
-        const cachedReqs = USER_REQ_CACHE.get(uname) || 0;
-        if (cachedBytes <= 0 && cachedReqs <= 0) continue;
-        if (GLOBAL_WRITE_LOCK.get(uname)) continue;
-        const lastActive = GLOBAL_LAST_ACTIVE_WRITE.get(uname) || 0;
-        const activeCount = ACTIVE_CONNECTIONS_COUNT.get(uname) || 0;
-        if (activeCount <= 0 || now - lastActive > 65000) {
-            GLOBAL_WRITE_LOCK.set(uname, true);
-            const deltaGb = cachedBytes / (1024 * 1024 * 1024);
-            try {
-                await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, used_req = used_req + ? WHERE username = ?").bind(deltaGb, cachedReqs, uname).run();
-            } catch (e) {
-                console.error(e.message);
-            } finally {
-                GLOBAL_WRITE_LOCK.delete(uname);
-                GLOBAL_TRAFFIC_CACHE.delete(uname);
-                USER_REQ_CACHE.delete(uname);
-                GLOBAL_LAST_ACTIVE_WRITE.delete(uname);
-            }
-        }
-    }
+	const now = Date.now();
+	for (const [uname, cachedBytes] of GLOBAL_TRAFFIC_CACHE.entries()) {
+		const cachedReqs = USER_REQ_CACHE.get(uname) || 0;
+		if (cachedBytes <= 0 && cachedReqs <= 0) continue;
+		if (GLOBAL_WRITE_LOCK.get(uname)) continue;
+		const lastActive = GLOBAL_LAST_ACTIVE_WRITE.get(uname) || 0;
+		const activeCount = ACTIVE_CONNECTIONS_COUNT.get(uname) || 0;
+		if (activeCount <= 0 || now - lastActive > 65000) {
+			GLOBAL_WRITE_LOCK.set(uname, true);
+			const deltaGb = cachedBytes / (1024 * 1024 * 1024);
+			try {
+				await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, used_req = used_req + ? WHERE username = ?").bind(deltaGb, cachedReqs, uname).run();
+			} catch (e) {
+				console.error(e.message);
+			} finally {
+				GLOBAL_WRITE_LOCK.delete(uname);
+				GLOBAL_TRAFFIC_CACHE.delete(uname);
+				USER_REQ_CACHE.delete(uname);
+				GLOBAL_LAST_ACTIVE_WRITE.delete(uname);
+			}
+		}
+	}
 }
 async function handleVLESS(env, storedData = null, ctx = null) {
-    const socketPair = new WebSocketPair();
-    const [clientSock, serverSock] = Object.values(socketPair);
-    serverSock.accept();
-    serverSock.binaryType = "arraybuffer";
-    let username = null;
-    let tickCount = 0;
-    let validUUID = null;
-    function addBytes(bytes) {
-        if (bytes <= 0) return;
-        if (!username) {
-            uncountedBytes += bytes;
-            return;
-        }
-        if (uncountedBytes > 0) {
-            bytes += uncountedBytes;
-            uncountedBytes = 0;
-        }
-        let current = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
-        GLOBAL_TRAFFIC_CACHE.set(username, current + bytes);
-        GLOBAL_LAST_ACTIVE_WRITE.set(username, Date.now());
-        if (GLOBAL_WRITE_LOCK.get(username)) return;
-        let lastDbWrite = GLOBAL_LAST_DB_WRITE.get(username) || 0;
-        let now = Date.now();
-        let thresholdBytes = 10 * 1024 * 1024;
-        if (current >= thresholdBytes || (current > 0 && now - lastDbWrite > 60000)) {
-            GLOBAL_WRITE_LOCK.set(username, true);
-            let toCommit = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
-            let toCommitReq = USER_REQ_CACHE.get(username) || 0;
-            if (toCommit <= 0 && toCommitReq <= 0) {
-                GLOBAL_WRITE_LOCK.set(username, false);
-                return;
-            }
-            GLOBAL_TRAFFIC_CACHE.set(username, 0);
-            USER_REQ_CACHE.set(username, 0);
-            GLOBAL_LAST_DB_WRITE.set(username, now);
-            let deltaGb = toCommit / (1024 * 1024 * 1024);
-            let writeTask = async () => {
-                try {
-                    await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, used_req = used_req + ? WHERE username = ?").bind(deltaGb, toCommitReq, username).run();
-                } catch (e) {
-                    console.error(e.message);
-                } finally {
-                    GLOBAL_WRITE_LOCK.set(username, false);
-                }
-            };
-            if (ctx) ctx.waitUntil(writeTask());
-            else writeTask();
-        }
-    }
-    let isOfflineSet = false;
-    const setOffline = () => {
-        if (isOfflineSet) return;
-        isOfflineSet = true;
-        const uname = username;
-        if (!uname) return;
-        let activeCount = ACTIVE_CONNECTIONS_COUNT.get(uname) || 1;
-        activeCount = activeCount - 1;
-        if (activeCount <= 0) {
-            ACTIVE_CONNECTIONS_COUNT.delete(uname);
-            let cachedBytes = GLOBAL_TRAFFIC_CACHE.get(uname) || 0;
-            let cachedReqs = USER_REQ_CACHE.get(uname) || 0;
-            if ((cachedBytes > 0 || cachedReqs > 0) && !GLOBAL_WRITE_LOCK.get(uname)) {
-                GLOBAL_WRITE_LOCK.set(uname, true);
-                const deltaGb = cachedBytes / (1024 * 1024 * 1024);
-                const writeTask = async () => {
-                    try {
-                        await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, used_req = used_req + ? WHERE username = ?").bind(deltaGb, cachedReqs, uname).run();
-                    } catch (e) {
-                        console.error(e.message);
-                    } finally {
-                        GLOBAL_WRITE_LOCK.delete(uname);
-                        GLOBAL_TRAFFIC_CACHE.delete(uname);
-                        USER_REQ_CACHE.delete(uname);
-                        GLOBAL_LAST_ACTIVE_WRITE.delete(uname);
-                    }
-                };
-                if (ctx) {
-                    ctx.waitUntil(writeTask());
-                } else {
-                    writeTask();
-                }
-            } else {
-                GLOBAL_TRAFFIC_CACHE.delete(uname);
-                USER_REQ_CACHE.delete(uname);
-                GLOBAL_LAST_ACTIVE_WRITE.delete(uname);
-                GLOBAL_WRITE_LOCK.delete(uname);
-            }
-        } else {
-            ACTIVE_CONNECTIONS_COUNT.set(uname, activeCount);
-        }
-    };
-    const heartbeat = setInterval(async () => {
-        if (serverSock.readyState === WebSocket.OPEN) {
-            try {
-                serverSock.send(new Uint8Array(0));
-                if (!validUUID) return;
-                tickCount++;
-                if (tickCount >= 4) {
-                    tickCount = 0;
-                    const user = await env.DB.prepare("SELECT is_active, limit_gb, used_gb, limit_req, used_req, expiry_days, created_at FROM users WHERE uuid = ?").bind(validUUID).first();
-                    let isExpired = false;
-                    if (!user || user.is_active === 0) {
-                        isExpired = true;
-                    } else {
-                        if (user.limit_gb && user.used_gb >= user.limit_gb) {
-                            isExpired = true;
-                        }
-                        if (user.limit_req && user.used_req + (USER_REQ_CACHE.get(username) || 0) >= user.limit_req) {
-                            isExpired = true;
-                        }
-                        if (user.expiry_days && user.created_at) {
-                            const created = new Date(user.created_at);
-                            const expiryDate = new Date(created.getTime() + user.expiry_days * 24 * 60 * 60 * 1000);
-                            if (new Date() > expiryDate) {
-                                isExpired = true;
-                            }
-                        }
-                    }
-                    if (isExpired) {
-                        await env.DB.prepare("UPDATE users SET is_active = 0, last_active = 0 WHERE uuid = ?").bind(validUUID).run();
-                        clearInterval(heartbeat);
-                        closeSocketQuietly(serverSock);
-                        return;
-                    }
-                    const now = Date.now();
-                    const lastRecorded = GLOBAL_LAST_ACTIVE_WRITE.get(username) || 0;
-                    if (now - lastRecorded > 15000) {
-                        GLOBAL_LAST_ACTIVE_WRITE.set(username, now);
-                        await env.DB.prepare("UPDATE users SET last_active = ? WHERE username = ?").bind(now, username).run();
-                    }
-                }
-            } catch (e) {}
-        } else {
-            clearInterval(heartbeat);
-        }
-    }, 15000);
-    let remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null };
-    let reqUUID = null;
-    let isHeaderParsed = false;
-    let isHeaderParsing = false;
-    let isDnsQuery = false;
-    let chunkBuffer = new Uint8Array(0);
-    let uncountedBytes = 0;
-    const proxyIP = storedData?.proxy_ip || "proxyip.cmliussss.net";
-    let wsChain = Promise.resolve();
-    let wsStopped = false,
-        wsFailed = false,
-        wsFinished = false;
-    let wsQueueBytes = 0,
-        wsQueueItems = 0;
-    let currentSocketWriter = null,
-        activeRemoteWriter = null;
-    const releaseRemoteWriter = () => {
-        if (activeRemoteWriter) {
-            try {
-                activeRemoteWriter.releaseLock();
-            } catch (e) {}
-            activeRemoteWriter = null;
-        }
-        currentSocketWriter = null;
-    };
-    const getRemoteWriter = () => {
-        const s = remoteConnWrapper.socket;
-        if (!s) return null;
-        if (s !== currentSocketWriter) {
-            releaseRemoteWriter();
-            currentSocketWriter = s;
-            activeRemoteWriter = s.writable.getWriter();
-        }
-        return activeRemoteWriter;
-    };
-    const upstreamQueue = createUpstreamQueue({
-        getWriter: getRemoteWriter,
-        releaseWriter: releaseRemoteWriter,
-        retryConnect: async () => {
-            if (typeof remoteConnWrapper.retryConnect === "function") {
-                await remoteConnWrapper.retryConnect();
-            }
-        },
-        closeConnection: () => {
-            try {
-                remoteConnWrapper.socket?.close();
-            } catch (e) {}
-            closeSocketQuietly(serverSock);
-        },
-        name: "VlessWSQueue",
-    });
-    const writeToRemote = async (chunk, allowRetry = true) => {
-        return upstreamQueue.writeAndAwait(chunk, allowRetry);
-    };
-    const processWsMessage = async (chunk) => {
-        const bytes = chunk.byteLength || 0;
-        await addBytes(bytes);
-        if (isDnsQuery) {
-            await forwardVlessUDP(chunk, serverSock, null, addBytes);
-            return;
-        }
-        if (await writeToRemote(chunk)) return;
-        if (!isHeaderParsed) {
-            chunkBuffer = concatBytes(chunkBuffer, chunk);
-            if (chunkBuffer.byteLength < 24) return;
-            if (isHeaderParsing) return;
-            isHeaderParsing = true;
-            reqUUID = extractUUIDFromVless(chunkBuffer);
-            if (!reqUUID) {
-                serverSock.close();
-                return;
-            }
-            let user = null;
-            try {
-                user = await env.DB.prepare("SELECT * FROM users WHERE uuid = ?").bind(reqUUID).first();
-            } catch (e) {}
-            if (isOfflineSet || serverSock.readyState !== WebSocket.OPEN) {
-                return;
-            }
-            if (!user || user.is_active === 0) {
-                serverSock.close();
-                return;
-            }
-            if (user.limit_gb && user.used_gb >= user.limit_gb) {
-                serverSock.close();
-                return;
-            }
-            if (user.limit_req && user.used_req + (USER_REQ_CACHE.get(user.username) || 0) >= user.limit_req) {
-                serverSock.close();
-                return;
-            }
-            if (user.expiry_days && user.created_at) {
-                const created = new Date(user.created_at);
-                const expiryDate = new Date(created.getTime() + user.expiry_days * 24 * 60 * 60 * 1000);
-                if (new Date() > expiryDate) {
-                    try {
-                        await env.DB.prepare("UPDATE users SET is_active = 0, last_active = 0 WHERE uuid = ?").bind(reqUUID).run();
-                    } catch (e) {}
-                    serverSock.close();
-                    return;
-                }
-            }
-            validUUID = reqUUID;
-            username = user.username;
-            isHeaderParsed = true;
-            let currentReqs = USER_REQ_CACHE.get(username) || 0;
-            USER_REQ_CACHE.set(username, currentReqs + 1);
-            let activeCount = ACTIVE_CONNECTIONS_COUNT.get(username) || 0;
-            if (user.max_connections && user.max_connections > 0 && activeCount >= user.max_connections) {
-                serverSock.close();
-                return;
-            }
-            ACTIVE_CONNECTIONS_COUNT.set(username, activeCount + 1);
-            if (activeCount === 0) {
-                const setOnlineTask = async () => {
-                    try {
-                        const now = Date.now();
-                        GLOBAL_LAST_ACTIVE_WRITE.set(username, now);
-                        await env.DB.prepare("UPDATE users SET last_active = ? WHERE username = ?").bind(now, username).run();
-                    } catch (e) {}
-                };
-                if (ctx) ctx.waitUntil(setOnlineTask());
-                else setOnlineTask();
-            }
-            try {
-                let offset = 17;
-                const optLen = chunkBuffer[offset++];
-                offset += optLen;
-                const cmd = chunkBuffer[offset++];
-                const port = (chunkBuffer[offset++] << 8) | chunkBuffer[offset++];
-                const addrType = chunkBuffer[offset++];
-                let addr = "";
-                if (addrType === 1) {
-                    addr = `${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}`;
-                } else if (addrType === 2) {
-                    const domainLen = chunkBuffer[offset++];
-                    addr = GLOBAL_DECODER.decode(chunkBuffer.slice(offset, offset + domainLen));
-                    offset += domainLen;
-                } else if (addrType === 3) {
-                    offset += 16;
-                    addr = "ipv6-unsupported";
-                }
-                const rawData = chunkBuffer.slice(offset);
-                const respHeader = new Uint8Array([chunkBuffer[0], 0]);
-                if (cmd === 2) {
-                    if (port === 53) {
-                        isDnsQuery = true;
-                        await forwardVlessUDP(rawData, serverSock, respHeader, addBytes);
-                    } else {
-                        serverSock.close();
-                    }
-                    return;
-                }
-                const connectTCP = async (dataPayload = null, useFallback = true) => {
-                    if (remoteConnWrapper.connectingPromise) {
-                        await remoteConnWrapper.connectingPromise;
-                        return;
-                    }
-                    const task = (async () => {
-                        let s = null;
-                        try {
-                            s = await connectDirect(addr, port, dataPayload);
-                        } catch (err) {
-                            if (useFallback && proxyIP) {
-                                s = await connectDirect(proxyIP, port, dataPayload);
-                            } else {
-                                throw err;
-                            }
-                        }
-                        remoteConnWrapper.socket = s;
-                        s.closed.catch(() => {}).finally(() => closeSocketQuietly(serverSock));
-                        connectStreams(s, serverSock, respHeader, null, (b) => {
-                            addBytes(b);
-                        });
-                    })();
-                    remoteConnWrapper.connectingPromise = task;
-                    try {
-                        await task;
-                    } finally {
-                        if (remoteConnWrapper.connectingPromise === task) {
-                            remoteConnWrapper.connectingPromise = null;
-                        }
-                    }
-                };
-                remoteConnWrapper.retryConnect = async () => connectTCP(null, false);
-                await connectTCP(rawData, true);
-            } catch (e) {
-                serverSock.close();
-            }
-        }
-    };
-    const handleWsError = (err) => {
-        if (wsFailed) return;
-        wsFailed = true;
-        wsStopped = true;
-        wsQueueBytes = 0;
-        wsQueueItems = 0;
-        upstreamQueue.clear();
-        releaseRemoteWriter();
-        closeSocketQuietly(serverSock);
-        setOffline();
-    };
-    const pushToChain = (task) => {
-        wsChain = wsChain.then(task).catch(handleWsError);
-    };
-    serverSock.addEventListener("message", (event) => {
-        if (wsStopped || wsFailed) return;
-        const size = event.data.byteLength || 0;
-        const nextBytes = wsQueueBytes + size;
-        const nextItems = wsQueueItems + 1;
-        if (nextBytes > UPSTREAM_QUEUE_MAX_BYTES || nextItems > UPSTREAM_QUEUE_MAX_ITEMS) {
-            handleWsError(new Error("ws queue overflow"));
-            return;
-        }
-        wsQueueBytes = nextBytes;
-        wsQueueItems = nextItems;
-        pushToChain(async () => {
-            wsQueueBytes = Math.max(0, wsQueueBytes - size);
-            wsQueueItems = Math.max(0, wsQueueItems - 1);
-            if (wsFailed) return;
-            await processWsMessage(event.data);
-        });
-    });
-    serverSock.addEventListener("close", () => {
-        clearInterval(heartbeat);
-        closeSocketQuietly(serverSock);
-        setOffline();
-        if (wsFinished) return;
-        wsFinished = true;
-        wsStopped = true;
-        pushToChain(async () => {
-            if (wsFailed) return;
-            await upstreamQueue.awaitEmpty();
-            releaseRemoteWriter();
-        });
-    });
-    serverSock.addEventListener("error", (err) => {
-        handleWsError(err);
-    });
-    return new Response(null, { status: 101, webSocket: clientSock });
+	const socketPair = new WebSocketPair();
+	const [clientSock, serverSock] = Object.values(socketPair);
+	serverSock.accept();
+	serverSock.binaryType = "arraybuffer";
+	let username = null;
+	let tickCount = 0;
+	let validUUID = null;
+	function addBytes(bytes) {
+		if (bytes <= 0) return;
+		if (!username) {
+			uncountedBytes += bytes;
+			return;
+		}
+		if (uncountedBytes > 0) {
+			bytes += uncountedBytes;
+			uncountedBytes = 0;
+		}
+		let current = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
+		GLOBAL_TRAFFIC_CACHE.set(username, current + bytes);
+		GLOBAL_LAST_ACTIVE_WRITE.set(username, Date.now());
+		if (GLOBAL_WRITE_LOCK.get(username)) return;
+		let lastDbWrite = GLOBAL_LAST_DB_WRITE.get(username) || 0;
+		let now = Date.now();
+		let thresholdBytes = 10 * 1024 * 1024;
+		if (current >= thresholdBytes || (current > 0 && now - lastDbWrite > 60000)) {
+			GLOBAL_WRITE_LOCK.set(username, true);
+			let toCommit = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
+			let toCommitReq = USER_REQ_CACHE.get(username) || 0;
+			if (toCommit <= 0 && toCommitReq <= 0) {
+				GLOBAL_WRITE_LOCK.set(username, false);
+				return;
+			}
+			GLOBAL_TRAFFIC_CACHE.set(username, 0);
+			USER_REQ_CACHE.set(username, 0);
+			GLOBAL_LAST_DB_WRITE.set(username, now);
+			let deltaGb = toCommit / (1024 * 1024 * 1024);
+			let writeTask = async () => {
+				try {
+					await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, used_req = used_req + ? WHERE username = ?").bind(deltaGb, toCommitReq, username).run();
+				} catch (e) {
+					console.error(e.message);
+				} finally {
+					GLOBAL_WRITE_LOCK.set(username, false);
+				}
+			};
+			if (ctx) ctx.waitUntil(writeTask());
+			else writeTask();
+		}
+	}
+	let isOfflineSet = false;
+	const setOffline = () => {
+		if (isOfflineSet) return;
+		isOfflineSet = true;
+		const uname = username;
+		if (!uname) return;
+		let activeCount = ACTIVE_CONNECTIONS_COUNT.get(uname) || 1;
+		activeCount = activeCount - 1;
+		if (activeCount <= 0) {
+			ACTIVE_CONNECTIONS_COUNT.delete(uname);
+			let cachedBytes = GLOBAL_TRAFFIC_CACHE.get(uname) || 0;
+			let cachedReqs = USER_REQ_CACHE.get(uname) || 0;
+			if ((cachedBytes > 0 || cachedReqs > 0) && !GLOBAL_WRITE_LOCK.get(uname)) {
+				GLOBAL_WRITE_LOCK.set(uname, true);
+				const deltaGb = cachedBytes / (1024 * 1024 * 1024);
+				const writeTask = async () => {
+					try {
+						await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, used_req = used_req + ? WHERE username = ?").bind(deltaGb, cachedReqs, uname).run();
+					} catch (e) {
+						console.error(e.message);
+					} finally {
+						GLOBAL_WRITE_LOCK.delete(uname);
+						GLOBAL_TRAFFIC_CACHE.delete(uname);
+						USER_REQ_CACHE.delete(uname);
+						GLOBAL_LAST_ACTIVE_WRITE.delete(uname);
+					}
+				};
+				if (ctx) {
+					ctx.waitUntil(writeTask());
+				} else {
+					writeTask();
+				}
+			} else {
+				GLOBAL_TRAFFIC_CACHE.delete(uname);
+				USER_REQ_CACHE.delete(uname);
+				GLOBAL_LAST_ACTIVE_WRITE.delete(uname);
+				GLOBAL_WRITE_LOCK.delete(uname);
+			}
+		} else {
+			ACTIVE_CONNECTIONS_COUNT.set(uname, activeCount);
+		}
+	};
+	const heartbeat = setInterval(async () => {
+		if (serverSock.readyState === WebSocket.OPEN) {
+			try {
+				serverSock.send(new Uint8Array(0));
+				if (!validUUID) return;
+				tickCount++;
+				if (tickCount >= 4) {
+					tickCount = 0;
+					const user = await env.DB.prepare("SELECT is_active, limit_gb, used_gb, limit_req, used_req, expiry_days, created_at FROM users WHERE uuid = ?").bind(validUUID).first();
+					let isExpired = false;
+					if (!user || user.is_active === 0) {
+						isExpired = true;
+					} else {
+						if (user.limit_gb && user.used_gb >= user.limit_gb) {
+							isExpired = true;
+						}
+						if (user.limit_req && user.used_req + (USER_REQ_CACHE.get(username) || 0) >= user.limit_req) {
+							isExpired = true;
+						}
+						if (user.expiry_days && user.created_at) {
+							const created = new Date(user.created_at);
+							const expiryDate = new Date(created.getTime() + user.expiry_days * 24 * 60 * 60 * 1000);
+							if (new Date() > expiryDate) {
+								isExpired = true;
+							}
+						}
+					}
+					if (isExpired) {
+						await env.DB.prepare("UPDATE users SET is_active = 0, last_active = 0 WHERE uuid = ?").bind(validUUID).run();
+						clearInterval(heartbeat);
+						closeSocketQuietly(serverSock);
+						return;
+					}
+					const now = Date.now();
+					const lastRecorded = GLOBAL_LAST_ACTIVE_WRITE.get(username) || 0;
+					if (now - lastRecorded > 15000) {
+						GLOBAL_LAST_ACTIVE_WRITE.set(username, now);
+						await env.DB.prepare("UPDATE users SET last_active = ? WHERE username = ?").bind(now, username).run();
+					}
+				}
+			} catch (e) {}
+		} else {
+			clearInterval(heartbeat);
+		}
+	}, 15000);
+	let remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null };
+	let reqUUID = null;
+	let isHeaderParsed = false;
+	let isHeaderParsing = false;
+	let isDnsQuery = false;
+	let chunkBuffer = new Uint8Array(0);
+	let uncountedBytes = 0;
+	const proxyIP = storedData?.proxy_ip || "proxyip.cmliussss.net";
+	let wsChain = Promise.resolve();
+	let wsStopped = false,
+		wsFailed = false,
+		wsFinished = false;
+	let wsQueueBytes = 0,
+		wsQueueItems = 0;
+	let currentSocketWriter = null,
+		activeRemoteWriter = null;
+	const releaseRemoteWriter = () => {
+		if (activeRemoteWriter) {
+			try {
+				activeRemoteWriter.releaseLock();
+			} catch (e) {}
+			activeRemoteWriter = null;
+		}
+		currentSocketWriter = null;
+	};
+	const getRemoteWriter = () => {
+		const s = remoteConnWrapper.socket;
+		if (!s) return null;
+		if (s !== currentSocketWriter) {
+			releaseRemoteWriter();
+			currentSocketWriter = s;
+			activeRemoteWriter = s.writable.getWriter();
+		}
+		return activeRemoteWriter;
+	};
+	const upstreamQueue = createUpstreamQueue({
+		getWriter: getRemoteWriter,
+		releaseWriter: releaseRemoteWriter,
+		retryConnect: async () => {
+			if (typeof remoteConnWrapper.retryConnect === "function") {
+				await remoteConnWrapper.retryConnect();
+			}
+		},
+		closeConnection: () => {
+			try {
+				remoteConnWrapper.socket?.close();
+			} catch (e) {}
+			closeSocketQuietly(serverSock);
+		},
+		name: "VlessWSQueue",
+	});
+	const writeToRemote = async (chunk, allowRetry = true) => {
+		return upstreamQueue.writeAndAwait(chunk, allowRetry);
+	};
+	const processWsMessage = async (chunk) => {
+		const bytes = chunk.byteLength || 0;
+		await addBytes(bytes);
+		if (isDnsQuery) {
+			await forwardVlessUDP(chunk, serverSock, null, addBytes);
+			return;
+		}
+		if (await writeToRemote(chunk)) return;
+		if (!isHeaderParsed) {
+			chunkBuffer = concatBytes(chunkBuffer, chunk);
+			if (chunkBuffer.byteLength < 24) return;
+			if (isHeaderParsing) return;
+			isHeaderParsing = true;
+			reqUUID = extractUUIDFromVless(chunkBuffer);
+			if (!reqUUID) {
+				serverSock.close();
+				return;
+			}
+			let user = null;
+			try {
+				user = await env.DB.prepare("SELECT * FROM users WHERE uuid = ?").bind(reqUUID).first();
+			} catch (e) {}
+			if (isOfflineSet || serverSock.readyState !== WebSocket.OPEN) {
+				return;
+			}
+			if (!user || user.is_active === 0) {
+				serverSock.close();
+				return;
+			}
+			if (user.limit_gb && user.used_gb >= user.limit_gb) {
+				serverSock.close();
+				return;
+			}
+			if (user.limit_req && user.used_req + (USER_REQ_CACHE.get(user.username) || 0) >= user.limit_req) {
+				serverSock.close();
+				return;
+			}
+			if (user.expiry_days && user.created_at) {
+				const created = new Date(user.created_at);
+				const expiryDate = new Date(created.getTime() + user.expiry_days * 24 * 60 * 60 * 1000);
+				if (new Date() > expiryDate) {
+					try {
+						await env.DB.prepare("UPDATE users SET is_active = 0, last_active = 0 WHERE uuid = ?").bind(reqUUID).run();
+					} catch (e) {}
+					serverSock.close();
+					return;
+				}
+			}
+			validUUID = reqUUID;
+			username = user.username;
+			isHeaderParsed = true;
+			let currentReqs = USER_REQ_CACHE.get(username) || 0;
+			USER_REQ_CACHE.set(username, currentReqs + 1);
+			let activeCount = ACTIVE_CONNECTIONS_COUNT.get(username) || 0;
+			if (user.max_connections && user.max_connections > 0 && activeCount >= user.max_connections) {
+				serverSock.close();
+				return;
+			}
+			ACTIVE_CONNECTIONS_COUNT.set(username, activeCount + 1);
+			if (activeCount === 0) {
+				const setOnlineTask = async () => {
+					try {
+						const now = Date.now();
+						GLOBAL_LAST_ACTIVE_WRITE.set(username, now);
+						await env.DB.prepare("UPDATE users SET last_active = ? WHERE username = ?").bind(now, username).run();
+					} catch (e) {}
+				};
+				if (ctx) ctx.waitUntil(setOnlineTask());
+				else setOnlineTask();
+			}
+			try {
+				let offset = 17;
+				const optLen = chunkBuffer[offset++];
+				offset += optLen;
+				const cmd = chunkBuffer[offset++];
+				const port = (chunkBuffer[offset++] << 8) | chunkBuffer[offset++];
+				const addrType = chunkBuffer[offset++];
+				let addr = "";
+				if (addrType === 1) {
+					addr = `${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}`;
+				} else if (addrType === 2) {
+					const domainLen = chunkBuffer[offset++];
+					addr = GLOBAL_DECODER.decode(chunkBuffer.slice(offset, offset + domainLen));
+					offset += domainLen;
+				} else if (addrType === 3) {
+					offset += 16;
+					addr = "ipv6-unsupported";
+				}
+				const rawData = chunkBuffer.slice(offset);
+				const respHeader = new Uint8Array([chunkBuffer[0], 0]);
+				if (cmd === 2) {
+					if (port === 53) {
+						isDnsQuery = true;
+						await forwardVlessUDP(rawData, serverSock, respHeader, addBytes);
+					} else {
+						serverSock.close();
+					}
+					return;
+				}
+				const connectTCP = async (dataPayload = null, useFallback = true) => {
+					if (remoteConnWrapper.connectingPromise) {
+						await remoteConnWrapper.connectingPromise;
+						return;
+					}
+					const task = (async () => {
+						let s = null;
+						try {
+							s = await connectDirect(addr, port, dataPayload);
+						} catch (err) {
+							if (useFallback && proxyIP) {
+								s = await connectDirect(proxyIP, port, dataPayload);
+							} else {
+								throw err;
+							}
+						}
+						remoteConnWrapper.socket = s;
+						s.closed.catch(() => {}).finally(() => closeSocketQuietly(serverSock));
+						connectStreams(s, serverSock, respHeader, null, (b) => {
+							addBytes(b);
+						});
+					})();
+					remoteConnWrapper.connectingPromise = task;
+					try {
+						await task;
+					} finally {
+						if (remoteConnWrapper.connectingPromise === task) {
+							remoteConnWrapper.connectingPromise = null;
+						}
+					}
+				};
+				remoteConnWrapper.retryConnect = async () => connectTCP(null, false);
+				await connectTCP(rawData, true);
+			} catch (e) {
+				serverSock.close();
+			}
+		}
+	};
+	const handleWsError = (err) => {
+		if (wsFailed) return;
+		wsFailed = true;
+		wsStopped = true;
+		wsQueueBytes = 0;
+		wsQueueItems = 0;
+		upstreamQueue.clear();
+		releaseRemoteWriter();
+		closeSocketQuietly(serverSock);
+		setOffline();
+	};
+	const pushToChain = (task) => {
+		wsChain = wsChain.then(task).catch(handleWsError);
+	};
+	serverSock.addEventListener("message", (event) => {
+		if (wsStopped || wsFailed) return;
+		const size = event.data.byteLength || 0;
+		const nextBytes = wsQueueBytes + size;
+		const nextItems = wsQueueItems + 1;
+		if (nextBytes > UPSTREAM_QUEUE_MAX_BYTES || nextItems > UPSTREAM_QUEUE_MAX_ITEMS) {
+			handleWsError(new Error("ws queue overflow"));
+			return;
+		}
+		wsQueueBytes = nextBytes;
+		wsQueueItems = nextItems;
+		pushToChain(async () => {
+			wsQueueBytes = Math.max(0, wsQueueBytes - size);
+			wsQueueItems = Math.max(0, wsQueueItems - 1);
+			if (wsFailed) return;
+			await processWsMessage(event.data);
+		});
+	});
+	serverSock.addEventListener("close", () => {
+		clearInterval(heartbeat);
+		closeSocketQuietly(serverSock);
+		setOffline();
+		if (wsFinished) return;
+		wsFinished = true;
+		wsStopped = true;
+		pushToChain(async () => {
+			if (wsFailed) return;
+			await upstreamQueue.awaitEmpty();
+			releaseRemoteWriter();
+		});
+	});
+	serverSock.addEventListener("error", (err) => {
+		handleWsError(err);
+	});
+	return new Response(null, { status: 101, webSocket: clientSock });
 }
 async function getCfUsage(env) {
-    if (!env.CF_API_TOKEN || !env.CF_ACCOUNT_ID) return { today: 0, total: 0 };
-    try {
-        const now = new Date();
-        const startOfDay = new Date(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()).toISOString();
-        const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();
-        const q = `query {
+	if (!env.CF_API_TOKEN || !env.CF_ACCOUNT_ID) return { today: 0, total: 0 };
+	try {
+		const now = new Date();
+		const startOfDay = new Date(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()).toISOString();
+		const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();
+		const q = `query {
       viewer {
         accounts(filter: {accountTag: "${env.CF_ACCOUNT_ID}"}) {
           today: workersInvocationsAdaptive(limit: 10, filter: {datetime_geq: "${startOfDay}"}) {
@@ -1443,632 +1184,628 @@ async function getCfUsage(env) {
         }
       }
     }`;
-        const res = await (typeof globalBypasser !== 'undefined' ? globalBypasser.smartFetch("https://api.cloudflare.com/client/v4/graphql", {
-            method: "POST",
-            headers: { Authorization: "Bearer " + env.CF_API_TOKEN, "Content-Type": "application/json" },
-            body: JSON.stringify({ query: q }),
-        }, 2) : fetch("https://api.cloudflare.com/client/v4/graphql", {
-            method: "POST",
-            headers: { Authorization: "Bearer " + env.CF_API_TOKEN, "Content-Type": "application/json" },
-            body: JSON.stringify({ query: q }),
-        }));
-        const j = await res.json();
-        const acc = j?.data?.viewer?.accounts?.[0];
-        const todayReqs = acc?.today?.[0]?.sum?.requests || 0;
-        const totalReqs = acc?.total?.[0]?.sum?.requests || todayReqs;
-        return { today: todayReqs, total: totalReqs };
-    } catch (e) {
-        return { today: 0, total: 0 };
-    }
+		const res = await fetch("https://api.cloudflare.com/client/v4/graphql", {
+			method: "POST",
+			headers: { Authorization: "Bearer " + env.CF_API_TOKEN, "Content-Type": "application/json" },
+			body: JSON.stringify({ query: q }),
+		});
+		const j = await res.json();
+		const acc = j?.data?.viewer?.accounts?.[0];
+		const todayReqs = acc?.today?.[0]?.sum?.requests || 0;
+		const totalReqs = acc?.total?.[0]?.sum?.requests || todayReqs;
+		return { today: todayReqs, total: totalReqs };
+	} catch (e) {
+		return { today: 0, total: 0 };
+	}
 }
 function isIPv4(value) {
-    const parts = String(value || "").split(".");
-    return parts.length === 4 && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) >= 0 && Number(part) <= 255);
+	const parts = String(value || "").split(".");
+	return parts.length === 4 && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) >= 0 && Number(part) <= 255);
 }
 function stripIPv6Brackets(hostname = "") {
-    const host = String(hostname || "").trim();
-    return host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+	const host = String(hostname || "").trim();
+	return host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
 }
 function isIPHostname(hostname = "") {
-    const host = stripIPv6Brackets(hostname);
-    if (isIPv4(host)) return true;
-    if (!host.includes(":")) return false;
-    try {
-        new URL(`http://[${host}]/`);
-        return true;
-    } catch (e) {
-        return false;
-    }
+	const host = stripIPv6Brackets(hostname);
+	if (isIPv4(host)) return true;
+	if (!host.includes(":")) return false;
+	try {
+		new URL(`http://[${host}]/`);
+		return true;
+	} catch (e) {
+		return false;
+	}
 }
 function convertToUint8Array(data) {
-    if (data instanceof Uint8Array) return data;
-    if (data instanceof ArrayBuffer) return new Uint8Array(data);
-    if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-    return new Uint8Array(data || 0);
+	if (data instanceof Uint8Array) return data;
+	if (data instanceof ArrayBuffer) return new Uint8Array(data);
+	if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+	return new Uint8Array(data || 0);
 }
 function concatBytes(...chunkList) {
-    const chunks = chunkList.map(convertToUint8Array);
-    const total = chunks.reduce((sum, c) => sum + c.byteLength, 0);
-    const result = new Uint8Array(total);
-    let offset = 0;
-    for (const c of chunks) {
-        result.set(c, offset);
-        offset += c.byteLength;
-    }
-    return result;
+	const chunks = chunkList.map(convertToUint8Array);
+	const total = chunks.reduce((sum, c) => sum + c.byteLength, 0);
+	const result = new Uint8Array(total);
+	let offset = 0;
+	for (const c of chunks) {
+		result.set(c, offset);
+		offset += c.byteLength;
+	}
+	return result;
 }
 function closeSocketQuietly(socket) {
-    try {
-        if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CLOSING) {
-            socket.close();
-        }
-    } catch (e) {}
+	try {
+		if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CLOSING) {
+			socket.close();
+		}
+	} catch (e) {}
 }
 async function dohQuery(domain, recordType) {
-    const cacheKey = `${domain}:${recordType}`;
-    if (DNS_CACHE.has(cacheKey)) {
-        const cached = DNS_CACHE.get(cacheKey);
-        if (Date.now() < cached.expires) return cached.data;
-        DNS_CACHE.delete(cacheKey);
-    }
-    try {
-        const typeMap = { A: 1, AAAA: 28 };
-        const qtype = typeMap[recordType.toUpperCase()] || 1;
-        const encodeDomain = (name) => {
-            const parts = name.endsWith(".") ? name.slice(0, -1).split(".") : name.split(".");
-            const bufs = [];
-            for (const label of parts) {
-                const enc = GLOBAL_ENCODER.encode(label);
-                bufs.push(new Uint8Array([enc.length]), enc);
-            }
-            bufs.push(new Uint8Array([0]));
-            return concatBytes(...bufs);
-        };
-        const qname = encodeDomain(domain);
-        const query = new Uint8Array(12 + qname.length + 4);
-        const qview = new DataView(query.buffer);
-        qview.setUint16(0, crypto.getRandomValues(new Uint16Array(1))[0]);
-        qview.setUint16(2, 0x0100);
-        qview.setUint16(4, 1);
-        query.set(qname, 12);
-        qview.setUint16(12 + qname.length, qtype);
-        qview.setUint16(12 + qname.length + 2, 1);
-        const response = await fetch(DOH_RESOLVER, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/dns-message",
-                Accept: "application/dns-message",
-            },
-            body: query,
-        });
-        if (!response.ok) return [];
-        const buf = new Uint8Array(await response.arrayBuffer());
-        const dv = new DataView(buf.buffer);
-        const qdcount = dv.getUint16(4);
-        const ancount = dv.getUint16(6);
-        const parseName = (pos) => {
-            const labels = [];
-            let p = pos,
-                jumped = false,
-                endPos = -1,
-                safe = 128;
-            while (p < buf.length && safe-- > 0) {
-                const len = buf[p];
-                if (len === 0) {
-                    if (!jumped) endPos = p + 1;
-                    break;
-                }
-                if ((len & 0xc0) === 0xc0) {
-                    if (!jumped) endPos = p + 2;
-                    p = ((len & 0x3f) << 8) | buf[p + 1];
-                    jumped = true;
-                    continue;
-                }
-                labels.push(GLOBAL_DECODER.decode(buf.slice(p + 1, p + 1 + len)));
-                p += len + 1;
-            }
-            if (endPos === -1) endPos = p + 1;
-            return [labels.join("."), endPos];
-        };
-        let offset = 12;
-        for (let i = 0; i < qdcount; i++) {
-            const [, end] = parseName(offset);
-            offset = Number(end) + 4;
-        }
-        const answers = [];
-        for (let i = 0; i < ancount && offset < buf.length; i++) {
-            const [name, nameEnd] = parseName(offset);
-            offset = Number(nameEnd);
-            const type = dv.getUint16(offset);
-            offset += 2;
-            offset += 2;
-            const ttl = dv.getUint32(offset);
-            offset += 4;
-            const rdlen = dv.getUint16(offset);
-            offset += 2;
-            const rdata = buf.slice(offset, offset + rdlen);
-            offset += rdlen;
-            let data;
-            if (type === 1 && rdlen === 4) {
-                data = `${rdata[0]}.${rdata[1]}.${rdata[2]}.${rdata[3]}`;
-            } else if (type === 28 && rdlen === 16) {
-                const segs = [];
-                for (let j = 0; j < 16; j += 2) segs.push(((rdata[j] << 8) | rdata[j + 1]).toString(16));
-                data = segs.join(":");
-            } else {
-                data = Array.from(rdata)
-                    .map((b) => b.toString(16).padStart(2, "0"))
-                    .join("");
-            }
-            answers.push({ name, type, TTL: ttl, data });
-        }
-        DNS_CACHE.set(cacheKey, { data: answers, expires: Date.now() + DNS_CACHE_TTL });
-        return answers;
-    } catch (e) {
-        return [];
-    }
+	const cacheKey = `${domain}:${recordType}`;
+	if (DNS_CACHE.has(cacheKey)) {
+		const cached = DNS_CACHE.get(cacheKey);
+		if (Date.now() < cached.expires) return cached.data;
+		DNS_CACHE.delete(cacheKey);
+	}
+	try {
+		const typeMap = { A: 1, AAAA: 28 };
+		const qtype = typeMap[recordType.toUpperCase()] || 1;
+		const encodeDomain = (name) => {
+			const parts = name.endsWith(".") ? name.slice(0, -1).split(".") : name.split(".");
+			const bufs = [];
+			for (const label of parts) {
+				const enc = GLOBAL_ENCODER.encode(label);
+				bufs.push(new Uint8Array([enc.length]), enc);
+			}
+			bufs.push(new Uint8Array([0]));
+			return concatBytes(...bufs);
+		};
+		const qname = encodeDomain(domain);
+		const query = new Uint8Array(12 + qname.length + 4);
+		const qview = new DataView(query.buffer);
+		qview.setUint16(0, crypto.getRandomValues(new Uint16Array(1))[0]);
+		qview.setUint16(2, 0x0100);
+		qview.setUint16(4, 1);
+		query.set(qname, 12);
+		qview.setUint16(12 + qname.length, qtype);
+		qview.setUint16(12 + qname.length + 2, 1);
+		const response = await fetch(DOH_RESOLVER, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/dns-message",
+				Accept: "application/dns-message",
+			},
+			body: query,
+		});
+		if (!response.ok) return [];
+		const buf = new Uint8Array(await response.arrayBuffer());
+		const dv = new DataView(buf.buffer);
+		const qdcount = dv.getUint16(4);
+		const ancount = dv.getUint16(6);
+		const parseName = (pos) => {
+			const labels = [];
+			let p = pos,
+				jumped = false,
+				endPos = -1,
+				safe = 128;
+			while (p < buf.length && safe-- > 0) {
+				const len = buf[p];
+				if (len === 0) {
+					if (!jumped) endPos = p + 1;
+					break;
+				}
+				if ((len & 0xc0) === 0xc0) {
+					if (!jumped) endPos = p + 2;
+					p = ((len & 0x3f) << 8) | buf[p + 1];
+					jumped = true;
+					continue;
+				}
+				labels.push(GLOBAL_DECODER.decode(buf.slice(p + 1, p + 1 + len)));
+				p += len + 1;
+			}
+			if (endPos === -1) endPos = p + 1;
+			return [labels.join("."), endPos];
+		};
+		let offset = 12;
+		for (let i = 0; i < qdcount; i++) {
+			const [, end] = parseName(offset);
+			offset = Number(end) + 4;
+		}
+		const answers = [];
+		for (let i = 0; i < ancount && offset < buf.length; i++) {
+			const [name, nameEnd] = parseName(offset);
+			offset = Number(nameEnd);
+			const type = dv.getUint16(offset);
+			offset += 2;
+			offset += 2;
+			const ttl = dv.getUint32(offset);
+			offset += 4;
+			const rdlen = dv.getUint16(offset);
+			offset += 2;
+			const rdata = buf.slice(offset, offset + rdlen);
+			offset += rdlen;
+			let data;
+			if (type === 1 && rdlen === 4) {
+				data = `${rdata[0]}.${rdata[1]}.${rdata[2]}.${rdata[3]}`;
+			} else if (type === 28 && rdlen === 16) {
+				const segs = [];
+				for (let j = 0; j < 16; j += 2) segs.push(((rdata[j] << 8) | rdata[j + 1]).toString(16));
+				data = segs.join(":");
+			} else {
+				data = Array.from(rdata)
+					.map((b) => b.toString(16).padStart(2, "0"))
+					.join("");
+			}
+			answers.push({ name, type, TTL: ttl, data });
+		}
+		DNS_CACHE.set(cacheKey, { data: answers, expires: Date.now() + DNS_CACHE_TTL });
+		return answers;
+	} catch (e) {
+		return [];
+	}
 }
 function createUpstreamQueue({ getWriter, releaseWriter, retryConnect, closeConnection, name = "UpstreamQueue" }) {
-    let chunks = [];
-    let head = 0;
-    let queuedBytes = 0;
-    let draining = false;
-    let closed = false;
-    let bundleBuffer = null;
-    let idleResolvers = [];
-    let activeCompletions = null;
-    const settleCompletions = (completions, err = null) => {
-        if (!completions) return;
-        for (const comp of completions) {
-            if (comp) {
-                if (err) comp.reject(err);
-                else comp.resolve();
-            }
-        }
-    };
-    const rejectQueued = (err) => {
-        for (let i = head; i < chunks.length; i++) {
-            const item = chunks[i];
-            if (item && item.completions) settleCompletions(item.completions, err);
-        }
-    };
-    const compact = () => {
-        if (head > 32 && head * 2 >= chunks.length) {
-            chunks = chunks.slice(head);
-            head = 0;
-        }
-    };
-    const resolveIdle = () => {
-        if (queuedBytes || draining || !idleResolvers.length) return;
-        const resolvers = idleResolvers;
-        idleResolvers = [];
-        for (const resolve of resolvers) resolve();
-    };
-    const clear = (err = null) => {
-        const closeErr = err || (closed ? new Error(`${name}: queue closed`) : null);
-        if (closeErr) {
-            rejectQueued(closeErr);
-            settleCompletions(activeCompletions, closeErr);
-            activeCompletions = null;
-        }
-        chunks = [];
-        head = 0;
-        queuedBytes = 0;
-        resolveIdle();
-    };
-    const shift = () => {
-        if (head >= chunks.length) return null;
-        const item = chunks[head];
-        chunks[head++] = undefined;
-        queuedBytes -= item.chunk.byteLength;
-        compact();
-        return item;
-    };
-    const bundle = () => {
-        const first = shift();
-        if (!first) return null;
-        if (head >= chunks.length || first.chunk.byteLength >= UPSTREAM_BUNDLE_TARGET_BYTES) return first;
-        let byteLength = first.chunk.byteLength;
-        let end = head;
-        let allowRetry = first.allowRetry;
-        let completions = first.completions || null;
-        while (end < chunks.length) {
-            const next = chunks[end];
-            const nextLength = byteLength + next.chunk.byteLength;
-            if (nextLength > UPSTREAM_BUNDLE_TARGET_BYTES) break;
-            byteLength = nextLength;
-            allowRetry = allowRetry && next.allowRetry;
-            if (next.completions) completions = completions ? completions.concat(next.completions) : next.completions;
-            end++;
-        }
-        if (end === head) return first;
-        const output = (bundleBuffer ||= new Uint8Array(UPSTREAM_BUNDLE_TARGET_BYTES));
-        output.set(first.chunk);
-        let offset = first.chunk.byteLength;
-        while (head < end) {
-            const next = chunks[head];
-            chunks[head++] = undefined;
-            queuedBytes -= next.chunk.byteLength;
-            output.set(next.chunk, offset);
-            offset += next.chunk.byteLength;
-        }
-        compact();
-        return { chunk: output.subarray(0, byteLength), allowRetry, completions };
-    };
-    const drain = async () => {
-        if (draining || closed) return;
-        draining = true;
-        try {
-            for (;;) {
-                if (closed) break;
-                const item = bundle();
-                if (!item) break;
-                let writer = getWriter();
-                if (!writer) throw new Error(`${name}: remote writer unavailable`);
-                const completions = item.completions || null;
-                activeCompletions = completions;
-                try {
-                    try {
-                        await writer.write(item.chunk);
-                    } catch (err) {
-                        releaseWriter?.();
-                        if (!item.allowRetry || typeof retryConnect !== "function") throw err;
-                        await retryConnect();
-                        writer = getWriter();
-                        if (!writer) throw err;
-                        await writer.write(item.chunk);
-                    }
-                    settleCompletions(completions);
-                } catch (err) {
-                    settleCompletions(completions, err);
-                    throw err;
-                } finally {
-                    if (activeCompletions === completions) activeCompletions = null;
-                }
-            }
-        } catch (err) {
-            closed = true;
-            clear(err);
-            try {
-                closeConnection?.(err);
-            } catch (_) {}
-        } finally {
-            draining = false;
-            if (!closed && head < chunks.length) queueMicrotask(drain);
-            else resolveIdle();
-        }
-    };
-    const enqueue = (data, allowRetry = true, waitForFlush = false) => {
-        if (closed) return false;
-        if (!getWriter()) return false;
-        const chunk = convertToUint8Array(data);
-        if (!chunk.byteLength) return true;
-        const nextBytes = queuedBytes + chunk.byteLength;
-        const nextItems = chunks.length - head + 1;
-        if (nextBytes > UPSTREAM_QUEUE_MAX_BYTES || nextItems > UPSTREAM_QUEUE_MAX_ITEMS) {
-            closed = true;
-            const err = Object.assign(new Error(`${name}: upload queue overflow (${nextBytes}B/${nextItems})`), { isQueueOverflow: true });
-            clear(err);
-            try {
-                closeConnection?.(err);
-            } catch (_) {}
-            throw err;
-        }
-        let completionPromise = null;
-        let completions = null;
-        if (waitForFlush) {
-            completions = [];
-            completionPromise = new Promise((resolve, reject) => completions.push({ resolve, reject }));
-        }
-        chunks.push({ chunk, allowRetry, completions });
-        queuedBytes = nextBytes;
-        if (!draining) queueMicrotask(drain);
-        return waitForFlush ? completionPromise.then(() => true) : true;
-    };
-    return {
-        writeAndAwait(data, allowRetry = true) {
-            return enqueue(data, allowRetry, true);
-        },
-        async awaitEmpty() {
-            if (!queuedBytes && !draining) return;
-            await new Promise((resolve) => idleResolvers.push(resolve));
-        },
-        clear() {
-            closed = true;
-            clear();
-        },
-    };
+	let chunks = [];
+	let head = 0;
+	let queuedBytes = 0;
+	let draining = false;
+	let closed = false;
+	let bundleBuffer = null;
+	let idleResolvers = [];
+	let activeCompletions = null;
+	const settleCompletions = (completions, err = null) => {
+		if (!completions) return;
+		for (const comp of completions) {
+			if (comp) {
+				if (err) comp.reject(err);
+				else comp.resolve();
+			}
+		}
+	};
+	const rejectQueued = (err) => {
+		for (let i = head; i < chunks.length; i++) {
+			const item = chunks[i];
+			if (item && item.completions) settleCompletions(item.completions, err);
+		}
+	};
+	const compact = () => {
+		if (head > 32 && head * 2 >= chunks.length) {
+			chunks = chunks.slice(head);
+			head = 0;
+		}
+	};
+	const resolveIdle = () => {
+		if (queuedBytes || draining || !idleResolvers.length) return;
+		const resolvers = idleResolvers;
+		idleResolvers = [];
+		for (const resolve of resolvers) resolve();
+	};
+	const clear = (err = null) => {
+		const closeErr = err || (closed ? new Error(`${name}: queue closed`) : null);
+		if (closeErr) {
+			rejectQueued(closeErr);
+			settleCompletions(activeCompletions, closeErr);
+			activeCompletions = null;
+		}
+		chunks = [];
+		head = 0;
+		queuedBytes = 0;
+		resolveIdle();
+	};
+	const shift = () => {
+		if (head >= chunks.length) return null;
+		const item = chunks[head];
+		chunks[head++] = undefined;
+		queuedBytes -= item.chunk.byteLength;
+		compact();
+		return item;
+	};
+	const bundle = () => {
+		const first = shift();
+		if (!first) return null;
+		if (head >= chunks.length || first.chunk.byteLength >= UPSTREAM_BUNDLE_TARGET_BYTES) return first;
+		let byteLength = first.chunk.byteLength;
+		let end = head;
+		let allowRetry = first.allowRetry;
+		let completions = first.completions || null;
+		while (end < chunks.length) {
+			const next = chunks[end];
+			const nextLength = byteLength + next.chunk.byteLength;
+			if (nextLength > UPSTREAM_BUNDLE_TARGET_BYTES) break;
+			byteLength = nextLength;
+			allowRetry = allowRetry && next.allowRetry;
+			if (next.completions) completions = completions ? completions.concat(next.completions) : next.completions;
+			end++;
+		}
+		if (end === head) return first;
+		const output = (bundleBuffer ||= new Uint8Array(UPSTREAM_BUNDLE_TARGET_BYTES));
+		output.set(first.chunk);
+		let offset = first.chunk.byteLength;
+		while (head < end) {
+			const next = chunks[head];
+			chunks[head++] = undefined;
+			queuedBytes -= next.chunk.byteLength;
+			output.set(next.chunk, offset);
+			offset += next.chunk.byteLength;
+		}
+		compact();
+		return { chunk: output.subarray(0, byteLength), allowRetry, completions };
+	};
+	const drain = async () => {
+		if (draining || closed) return;
+		draining = true;
+		try {
+			for (;;) {
+				if (closed) break;
+				const item = bundle();
+				if (!item) break;
+				let writer = getWriter();
+				if (!writer) throw new Error(`${name}: remote writer unavailable`);
+				const completions = item.completions || null;
+				activeCompletions = completions;
+				try {
+					try {
+						await writer.write(item.chunk);
+					} catch (err) {
+						releaseWriter?.();
+						if (!item.allowRetry || typeof retryConnect !== "function") throw err;
+						await retryConnect();
+						writer = getWriter();
+						if (!writer) throw err;
+						await writer.write(item.chunk);
+					}
+					settleCompletions(completions);
+				} catch (err) {
+					settleCompletions(completions, err);
+					throw err;
+				} finally {
+					if (activeCompletions === completions) activeCompletions = null;
+				}
+			}
+		} catch (err) {
+			closed = true;
+			clear(err);
+			try {
+				closeConnection?.(err);
+			} catch (_) {}
+		} finally {
+			draining = false;
+			if (!closed && head < chunks.length) queueMicrotask(drain);
+			else resolveIdle();
+		}
+	};
+	const enqueue = (data, allowRetry = true, waitForFlush = false) => {
+		if (closed) return false;
+		if (!getWriter()) return false;
+		const chunk = convertToUint8Array(data);
+		if (!chunk.byteLength) return true;
+		const nextBytes = queuedBytes + chunk.byteLength;
+		const nextItems = chunks.length - head + 1;
+		if (nextBytes > UPSTREAM_QUEUE_MAX_BYTES || nextItems > UPSTREAM_QUEUE_MAX_ITEMS) {
+			closed = true;
+			const err = Object.assign(new Error(`${name}: upload queue overflow (${nextBytes}B/${nextItems})`), { isQueueOverflow: true });
+			clear(err);
+			try {
+				closeConnection?.(err);
+			} catch (_) {}
+			throw err;
+		}
+		let completionPromise = null;
+		let completions = null;
+		if (waitForFlush) {
+			completions = [];
+			completionPromise = new Promise((resolve, reject) => completions.push({ resolve, reject }));
+		}
+		chunks.push({ chunk, allowRetry, completions });
+		queuedBytes = nextBytes;
+		if (!draining) queueMicrotask(drain);
+		return waitForFlush ? completionPromise.then(() => true) : true;
+	};
+	return {
+		writeAndAwait(data, allowRetry = true) {
+			return enqueue(data, allowRetry, true);
+		},
+		async awaitEmpty() {
+			if (!queuedBytes && !draining) return;
+			await new Promise((resolve) => idleResolvers.push(resolve));
+		},
+		clear() {
+			closed = true;
+			clear();
+		},
+	};
 }
 function createDownstreamSender(webSocket, headerData = null) {
-    const packetCap = DOWNSTREAM_GRAIN_BYTES;
-    const tailBytes = DOWNSTREAM_GRAIN_TAIL_THRESHOLD;
-    const lowWaterBytes = Math.max(4096, tailBytes << 3);
-    let header = headerData;
-    let pendingBuffer = new Uint8Array(packetCap);
-    let pendingBytes = 0;
-    let flushTimer = null;
-    let microtaskQueued = false;
-    let generation = 0;
-    let scheduledGeneration = 0;
-    let waitRounds = 0;
-    let flushPromise = null;
-    const sendRawChunk = async (chunk) => {
-        if (webSocket.readyState !== WebSocket.OPEN) throw new Error("ws.readyState is not open");
-        webSocket.send(chunk);
-    };
-    const attachResponseHeader = (chunk) => {
-        if (!header) return chunk;
-        const merged = new Uint8Array(header.length + chunk.byteLength);
-        merged.set(header, 0);
-        merged.set(chunk, header.length);
-        header = null;
-        return merged;
-    };
-    const flush = async () => {
-        while (flushPromise) await flushPromise;
-        if (flushTimer) clearTimeout(flushTimer);
-        flushTimer = null;
-        microtaskQueued = false;
-        if (!pendingBytes) return;
-        const output = pendingBuffer.subarray(0, pendingBytes).slice();
-        pendingBuffer = new Uint8Array(packetCap);
-        pendingBytes = 0;
-        waitRounds = 0;
-        flushPromise = sendRawChunk(output).finally(() => {
-            flushPromise = null;
-        });
-        return flushPromise;
-    };
-    const scheduleFlush = () => {
-        if (flushTimer || microtaskQueued) return;
-        microtaskQueued = true;
-        scheduledGeneration = generation;
-        queueMicrotask(() => {
-            microtaskQueued = false;
-            if (!pendingBytes || flushTimer) return;
-            if (packetCap - pendingBytes < tailBytes) {
-                flush().catch(() => closeSocketQuietly(webSocket));
-                return;
-            }
-            flushTimer = setTimeout(
-                () => {
-                    flushTimer = null;
-                    if (!pendingBytes) return;
-                    if (packetCap - pendingBytes < tailBytes) {
-                        flush().catch(() => closeSocketQuietly(webSocket));
-                        return;
-                    }
-                    if (waitRounds < 2 && (generation !== scheduledGeneration || pendingBytes < lowWaterBytes)) {
-                        waitRounds++;
-                        scheduledGeneration = generation;
-                        scheduleFlush();
-                        return;
-                    }
-                    flush().catch(() => closeSocketQuietly(webSocket));
-                },
-                Math.max(DOWNSTREAM_GRAIN_SILENT_MS, 1),
-            );
-        });
-    };
-    return {
-        async sendDirect(data) {
-            let chunk = convertToUint8Array(data);
-            if (!chunk.byteLength) return;
-            chunk = attachResponseHeader(chunk);
-            await sendRawChunk(chunk);
-        },
-        async send(data) {
-            let chunk = convertToUint8Array(data);
-            if (!chunk.byteLength) return;
-            chunk = attachResponseHeader(chunk);
-            let offset = 0;
-            const totalBytes = chunk.byteLength;
-            while (offset < totalBytes) {
-                if (!pendingBytes && totalBytes - offset >= packetCap) {
-                    const sendBytes = Math.min(packetCap, totalBytes - offset);
-                    const view = offset || sendBytes !== totalBytes ? chunk.subarray(offset, offset + sendBytes) : chunk;
-                    await sendRawChunk(view);
-                    offset += sendBytes;
-                    continue;
-                }
-                const copyBytes = Math.min(packetCap - pendingBytes, totalBytes - offset);
-                pendingBuffer.set(chunk.subarray(offset, offset + copyBytes), pendingBytes);
-                pendingBytes += copyBytes;
-                offset += copyBytes;
-                generation++;
-                if (pendingBytes === packetCap || packetCap - pendingBytes < tailBytes) await flush();
-                else scheduleFlush();
-            }
-        },
-        flush,
-    };
+	const packetCap = DOWNSTREAM_GRAIN_BYTES;
+	const tailBytes = DOWNSTREAM_GRAIN_TAIL_THRESHOLD;
+	const lowWaterBytes = Math.max(4096, tailBytes << 3);
+	let header = headerData;
+	let pendingBuffer = new Uint8Array(packetCap);
+	let pendingBytes = 0;
+	let flushTimer = null;
+	let microtaskQueued = false;
+	let generation = 0;
+	let scheduledGeneration = 0;
+	let waitRounds = 0;
+	let flushPromise = null;
+	const sendRawChunk = async (chunk) => {
+		if (webSocket.readyState !== WebSocket.OPEN) throw new Error("ws.readyState is not open");
+		webSocket.send(chunk);
+	};
+	const attachResponseHeader = (chunk) => {
+		if (!header) return chunk;
+		const merged = new Uint8Array(header.length + chunk.byteLength);
+		merged.set(header, 0);
+		merged.set(chunk, header.length);
+		header = null;
+		return merged;
+	};
+	const flush = async () => {
+		while (flushPromise) await flushPromise;
+		if (flushTimer) clearTimeout(flushTimer);
+		flushTimer = null;
+		microtaskQueued = false;
+		if (!pendingBytes) return;
+		const output = pendingBuffer.subarray(0, pendingBytes).slice();
+		pendingBuffer = new Uint8Array(packetCap);
+		pendingBytes = 0;
+		waitRounds = 0;
+		flushPromise = sendRawChunk(output).finally(() => {
+			flushPromise = null;
+		});
+		return flushPromise;
+	};
+	const scheduleFlush = () => {
+		if (flushTimer || microtaskQueued) return;
+		microtaskQueued = true;
+		scheduledGeneration = generation;
+		queueMicrotask(() => {
+			microtaskQueued = false;
+			if (!pendingBytes || flushTimer) return;
+			if (packetCap - pendingBytes < tailBytes) {
+				flush().catch(() => closeSocketQuietly(webSocket));
+				return;
+			}
+			flushTimer = setTimeout(
+				() => {
+					flushTimer = null;
+					if (!pendingBytes) return;
+					if (packetCap - pendingBytes < tailBytes) {
+						flush().catch(() => closeSocketQuietly(webSocket));
+						return;
+					}
+					if (waitRounds < 2 && (generation !== scheduledGeneration || pendingBytes < lowWaterBytes)) {
+						waitRounds++;
+						scheduledGeneration = generation;
+						scheduleFlush();
+						return;
+					}
+					flush().catch(() => closeSocketQuietly(webSocket));
+				},
+				Math.max(DOWNSTREAM_GRAIN_SILENT_MS, 1),
+			);
+		});
+	};
+	return {
+		async sendDirect(data) {
+			let chunk = convertToUint8Array(data);
+			if (!chunk.byteLength) return;
+			chunk = attachResponseHeader(chunk);
+			await sendRawChunk(chunk);
+		},
+		async send(data) {
+			let chunk = convertToUint8Array(data);
+			if (!chunk.byteLength) return;
+			chunk = attachResponseHeader(chunk);
+			let offset = 0;
+			const totalBytes = chunk.byteLength;
+			while (offset < totalBytes) {
+				if (!pendingBytes && totalBytes - offset >= packetCap) {
+					const sendBytes = Math.min(packetCap, totalBytes - offset);
+					const view = offset || sendBytes !== totalBytes ? chunk.subarray(offset, offset + sendBytes) : chunk;
+					await sendRawChunk(view);
+					offset += sendBytes;
+					continue;
+				}
+				const copyBytes = Math.min(packetCap - pendingBytes, totalBytes - offset);
+				pendingBuffer.set(chunk.subarray(offset, offset + copyBytes), pendingBytes);
+				pendingBytes += copyBytes;
+				offset += copyBytes;
+				generation++;
+				if (pendingBytes === packetCap || packetCap - pendingBytes < tailBytes) await flush();
+				else scheduleFlush();
+			}
+		},
+		flush,
+	};
 }
 async function waitForBackpressure(ws) {
-    if (typeof ws.bufferedAmount === "number") {
-        while (ws.bufferedAmount > 256 * 1024) {
-            await new Promise((r) => setTimeout(r, 100));
-        }
-    }
+	if (typeof ws.bufferedAmount === "number") {
+		while (ws.bufferedAmount > 256 * 1024) {
+			await new Promise((r) => setTimeout(r, 100));
+		}
+	}
 }
 async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, onBytes) {
-    let header = headerData,
-        hasData = false,
-        reader,
-        useBYOB = false;
-    const BYOB_LIMIT = 64 * 1024;
-    const downstreamSender = createDownstreamSender(webSocket, header);
-    header = null;
-    try {
-        reader = remoteSocket.readable.getReader({ mode: "byob" });
-        useBYOB = true;
-    } catch (e) {
-        reader = remoteSocket.readable.getReader();
-    }
-    try {
-        if (!useBYOB) {
-            while (true) {
-                await waitForBackpressure(webSocket);
-                const { done, value } = await reader.read();
-                if (done) break;
-                if (!value || value.byteLength === 0) continue;
-                hasData = true;
-                if (typeof onBytes === "function") onBytes(value.byteLength);
-                await downstreamSender.send(value);
-            }
-        } else {
-            let readBuffer = new ArrayBuffer(BYOB_LIMIT);
-            while (true) {
-                await waitForBackpressure(webSocket);
-                const { done, value } = await reader.read(new Uint8Array(readBuffer, 0, BYOB_LIMIT));
-                if (done) break;
-                if (!value || value.byteLength === 0) continue;
-                hasData = true;
-                if (typeof onBytes === "function") onBytes(value.byteLength);
-                if (value.byteLength >= DOWNSTREAM_GRAIN_BYTES) {
-                    await downstreamSender.flush();
-                    await downstreamSender.sendDirect(value);
-                    readBuffer = new ArrayBuffer(BYOB_LIMIT);
-                } else {
-                    await downstreamSender.send(value);
-                    readBuffer = value.buffer.byteLength >= BYOB_LIMIT ? value.buffer : new ArrayBuffer(BYOB_LIMIT);
-                }
-            }
-        }
-        await downstreamSender.flush();
-    } catch (err) {
-        closeSocketQuietly(webSocket);
-    } finally {
-        try {
-            reader.cancel();
-        } catch (e) {}
-        try {
-            reader.releaseLock();
-        } catch (e) {}
-    }
-    if (!hasData && retryFunc) await retryFunc();
+	let header = headerData,
+		hasData = false,
+		reader,
+		useBYOB = false;
+	const BYOB_LIMIT = 64 * 1024;
+	const downstreamSender = createDownstreamSender(webSocket, header);
+	header = null;
+	try {
+		reader = remoteSocket.readable.getReader({ mode: "byob" });
+		useBYOB = true;
+	} catch (e) {
+		reader = remoteSocket.readable.getReader();
+	}
+	try {
+		if (!useBYOB) {
+			while (true) {
+				await waitForBackpressure(webSocket);
+				const { done, value } = await reader.read();
+				if (done) break;
+				if (!value || value.byteLength === 0) continue;
+				hasData = true;
+				if (typeof onBytes === "function") onBytes(value.byteLength);
+				await downstreamSender.send(value);
+			}
+		} else {
+			let readBuffer = new ArrayBuffer(BYOB_LIMIT);
+			while (true) {
+				await waitForBackpressure(webSocket);
+				const { done, value } = await reader.read(new Uint8Array(readBuffer, 0, BYOB_LIMIT));
+				if (done) break;
+				if (!value || value.byteLength === 0) continue;
+				hasData = true;
+				if (typeof onBytes === "function") onBytes(value.byteLength);
+				if (value.byteLength >= DOWNSTREAM_GRAIN_BYTES) {
+					await downstreamSender.flush();
+					await downstreamSender.sendDirect(value);
+					readBuffer = new ArrayBuffer(BYOB_LIMIT);
+				} else {
+					await downstreamSender.send(value);
+					readBuffer = value.buffer.byteLength >= BYOB_LIMIT ? value.buffer : new ArrayBuffer(BYOB_LIMIT);
+				}
+			}
+		}
+		await downstreamSender.flush();
+	} catch (err) {
+		closeSocketQuietly(webSocket);
+	} finally {
+		try {
+			reader.cancel();
+		} catch (e) {}
+		try {
+			reader.releaseLock();
+		} catch (e) {}
+	}
+	if (!hasData && retryFunc) await retryFunc();
 }
 async function buildRaceCandidates(address, port) {
-    if (!PRELOAD_RACE_DIAL || isIPHostname(address)) return null;
-    const [aRecords, aaaaRecords] = await Promise.all([dohQuery(address, "A"), dohQuery(address, "AAAA")]);
-    const ipv4List = [
-        ...new Set(
-            aRecords.flatMap((r) => {
-                return r.type === 1 && typeof r.data === "string" && isIPv4(r.data) ? [r.data] : [];
-            }),
-        ),
-    ];
-    const ipv6List = [
-        ...new Set(
-            aaaaRecords.flatMap((r) => {
-                return r.type === 28 && typeof r.data === "string" && isIPHostname(r.data) ? [r.data] : [];
-            }),
-        ),
-    ];
-    const limit = Math.max(1, TCP_CONCURRENCY | 0);
-    const ipList = ipv4List.length >= limit ? ipv4List.slice(0, limit) : ipv4List.concat(ipv6List.slice(0, limit - ipv4List.length));
-    if (ipList.length === 0) return null;
-    return ipList.map((hostname, attempt) => ({ hostname, port, attempt, resolvedFrom: address }));
+	if (!PRELOAD_RACE_DIAL || isIPHostname(address)) return null;
+	const [aRecords, aaaaRecords] = await Promise.all([dohQuery(address, "A"), dohQuery(address, "AAAA")]);
+	const ipv4List = [
+		...new Set(
+			aRecords.flatMap((r) => {
+				return r.type === 1 && typeof r.data === "string" && isIPv4(r.data) ? [r.data] : [];
+			}),
+		),
+	];
+	const ipv6List = [
+		...new Set(
+			aaaaRecords.flatMap((r) => {
+				return r.type === 28 && typeof r.data === "string" && isIPHostname(r.data) ? [r.data] : [];
+			}),
+		),
+	];
+	const limit = Math.max(1, TCP_CONCURRENCY | 0);
+	const ipList = ipv4List.length >= limit ? ipv4List.slice(0, limit) : ipv4List.concat(ipv6List.slice(0, limit - ipv4List.length));
+	if (ipList.length === 0) return null;
+	return ipList.map((hostname, attempt) => ({ hostname, port, attempt, resolvedFrom: address }));
 }
 async function connectDirect(address, port, initialData = null) {
-    const raceCandidates = await buildRaceCandidates(address, port);
-    const candidates = raceCandidates || Array.from({ length: TCP_CONCURRENCY }, () => ({ hostname: address, port }));
-    const openConnection = async (host, prt) => {
-        const socket = connect({ hostname: host, port: prt });
-        await Promise.race([socket.opened, new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 1000))]);
-        return socket;
-    };
-    if (candidates.length === 1) {
-        const s = await openConnection(candidates[0].hostname, candidates[0].port);
-        if (initialData && initialData.byteLength > 0) {
-            const w = s.writable.getWriter();
-            await w.write(convertToUint8Array(initialData));
-            w.releaseLock();
-        }
-        return s;
-    }
-    const attempts = candidates.map((c) => openConnection(c.hostname, c.port).then((socket) => ({ socket, candidate: c })));
-    let winner = null;
-    try {
-        winner = await Promise.any(attempts);
-        if (initialData && initialData.byteLength > 0) {
-            const w = winner.socket.writable.getWriter();
-            await w.write(convertToUint8Array(initialData));
-            w.releaseLock();
-        }
-        return winner.socket;
-    } finally {
-        if (winner) {
-            for (const attempt of attempts) {
-                attempt
-                    .then(({ socket }) => {
-                        if (socket !== winner.socket) {
-                            try {
-                                socket.close();
-                            } catch (e) {}
-                        }
-                    })
-                    .catch(() => {});
-            }
-        }
-    }
+	const raceCandidates = await buildRaceCandidates(address, port);
+	const candidates = raceCandidates || Array.from({ length: TCP_CONCURRENCY }, () => ({ hostname: address, port }));
+	const openConnection = async (host, prt) => {
+		const socket = connect({ hostname: host, port: prt });
+		await Promise.race([socket.opened, new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 1000))]);
+		return socket;
+	};
+	if (candidates.length === 1) {
+		const s = await openConnection(candidates[0].hostname, candidates[0].port);
+		if (initialData && initialData.byteLength > 0) {
+			const w = s.writable.getWriter();
+			await w.write(convertToUint8Array(initialData));
+			w.releaseLock();
+		}
+		return s;
+	}
+	const attempts = candidates.map((c) => openConnection(c.hostname, c.port).then((socket) => ({ socket, candidate: c })));
+	let winner = null;
+	try {
+		winner = await Promise.any(attempts);
+		if (initialData && initialData.byteLength > 0) {
+			const w = winner.socket.writable.getWriter();
+			await w.write(convertToUint8Array(initialData));
+			w.releaseLock();
+		}
+		return winner.socket;
+	} finally {
+		if (winner) {
+			for (const attempt of attempts) {
+				attempt
+					.then(({ socket }) => {
+						if (socket !== winner.socket) {
+							try {
+								socket.close();
+							} catch (e) {}
+						}
+					})
+					.catch(() => {});
+			}
+		}
+	}
 }
 async function forwardVlessUDP(udpChunk, webSocket, respHeader, onBytes) {
-    const requestData = convertToUint8Array(udpChunk);
-    try {
-        const tcpSocket = connect({ hostname: "8.8.4.4", port: 53 });
-        let vlessHeader = respHeader;
-        const writer = tcpSocket.writable.getWriter();
-        await writer.write(requestData);
-        writer.releaseLock();
-        await tcpSocket.readable.pipeTo(
-            new WritableStream({
-                async write(chunk) {
-                    const response = convertToUint8Array(chunk);
-                    if (typeof onBytes === "function") onBytes(response.byteLength);
-                    if (webSocket.readyState !== WebSocket.OPEN) return;
-                    if (vlessHeader) {
-                        const merged = new Uint8Array(vlessHeader.length + response.byteLength);
-                        merged.set(vlessHeader, 0);
-                        merged.set(response, vlessHeader.length);
-                        webSocket.send(merged.buffer);
-                        vlessHeader = null;
-                    } else {
-                        webSocket.send(response);
-                    }
-                },
-            }),
-        );
-    } catch (e) {}
+	const requestData = convertToUint8Array(udpChunk);
+	try {
+		const tcpSocket = connect({ hostname: "8.8.4.4", port: 53 });
+		let vlessHeader = respHeader;
+		const writer = tcpSocket.writable.getWriter();
+		await writer.write(requestData);
+		writer.releaseLock();
+		await tcpSocket.readable.pipeTo(
+			new WritableStream({
+				async write(chunk) {
+					const response = convertToUint8Array(chunk);
+					if (typeof onBytes === "function") onBytes(response.byteLength);
+					if (webSocket.readyState !== WebSocket.OPEN) return;
+					if (vlessHeader) {
+						const merged = new Uint8Array(vlessHeader.length + response.byteLength);
+						merged.set(vlessHeader, 0);
+						merged.set(response, vlessHeader.length);
+						webSocket.send(merged.buffer);
+						vlessHeader = null;
+					} else {
+						webSocket.send(response);
+					}
+				},
+			}),
+		);
+	} catch (e) {}
 }
 
 function trackRequest(env, ctx) {
-    GLOBAL_REQ_COUNT++;
-    const now = Date.now();
-    if (now - GLOBAL_LAST_REQ_WRITE > 60000 && GLOBAL_REQ_COUNT > 0) {
-        GLOBAL_LAST_REQ_WRITE = now;
-        const countToSave = GLOBAL_REQ_COUNT;
-        GLOBAL_REQ_COUNT = 0;
-        const task = async () => {
-            try {
-                const today = new Date().toISOString().split("T")[0];
-                
+	GLOBAL_REQ_COUNT++;
+	const now = Date.now();
+	if (now - GLOBAL_LAST_REQ_WRITE > 60000 && GLOBAL_REQ_COUNT > 0) {
+		GLOBAL_LAST_REQ_WRITE = now;
+		const countToSave = GLOBAL_REQ_COUNT;
+		GLOBAL_REQ_COUNT = 0;
+		const task = async () => {
+			try {
+				const today = new Date().toISOString().split("T")[0];
+				
                 // اصلاح نوع داده: عدد به عنوان Integer پاس داده می‌شود تا عمل جمع به درستی صورت گیرد
-                await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_total', ?) ON CONFLICT(key) DO UPDATE SET value = CAST((CAST(value AS INTEGER) + ?) AS TEXT)").bind(String(countToSave), countToSave).run();
-                
-                const lastDateRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'req_last_date'").first();
-                if (!lastDateRow || lastDateRow.value !== today) {
-                    await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_last_date', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(today, today).run();
-                    await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(countToSave), String(countToSave)).run();
-                } else {
-                    await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = CAST((CAST(value AS INTEGER) + ?) AS TEXT)").bind(String(countToSave), countToSave).run();
-                }
-            } catch (e) {
+				await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_total', ?) ON CONFLICT(key) DO UPDATE SET value = CAST((CAST(value AS INTEGER) + ?) AS TEXT)").bind(String(countToSave), countToSave).run();
+				
+				const lastDateRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'req_last_date'").first();
+				if (!lastDateRow || lastDateRow.value !== today) {
+					await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_last_date', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(today, today).run();
+					await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(countToSave), String(countToSave)).run();
+				} else {
+					await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = CAST((CAST(value AS INTEGER) + ?) AS TEXT)").bind(String(countToSave), countToSave).run();
+				}
+			} catch (e) {
                 console.error("Track DB Error:", e.message);
             }
-        };
-        if (ctx) ctx.waitUntil(task());
-        else task();
-    }
+		};
+		if (ctx) ctx.waitUntil(task());
+		else task();
+	}
 }
 
 function extractUUIDFromVless(data) {
@@ -2144,67 +1881,33 @@ async function handleRailwayWS(request, env, ctx, userUuid) {
         }
     }
 
-    // ۶. آماده‌سازی هدرها با سیستم Bypass - ترکیب IP+TLS+Cookie+Timing
+    // ۶. آماده‌سازی هدرها برای ارسال به بک‌اِند
+    const newHeaders = new Headers(request.headers);
     let railwayResponse = null;
 
-    // ۷. موتور هوشمند Failover با Request Waterfall + TLS Rotation + Header Randomization
-    const recentRate = typeof globalBypasser !== 'undefined' ? globalBypasser.getRecentRequestRate() : 0;
-    const jitterBase = Math.max(50, Math.min(500, 10000 / (recentRate + 1)));
-
-    const backendAttempts = RAILWAY_BACKENDS.map((backend, idx) => {
-        const jitter = jitterBase + Math.floor(Math.random() * jitterBase);
-        return { backend, delay: idx * jitter, idx };
-    });
-
-    for (const { backend, delay, idx } of backendAttempts) {
-        if (delay > 0) {
-            await new Promise(r => setTimeout(r, delay));
-        }
+    // ۷. موتور هوشمند Failover
+    for (const backend of RAILWAY_BACKENDS) {
         try {
             const railwayUrl = new URL(request.url);
             railwayUrl.hostname = backend;
-            railwayUrl.pathname = "/Ma_Ke_Vaslim";
+            railwayUrl.pathname = "/Ma_Ke_Vaslim"; 
             railwayUrl.protocol = "https:";
             railwayUrl.port = "443";
-
-            // ساخت هدر با ترکیب اصلی + تصادفی (حفظ هدرهای WS)
-            const attemptHeaders = new Headers(request.headers);
-            if (typeof globalBypasser !== 'undefined') {
-                const randomHdrs = globalBypasser.generateRandomHeaders();
-                for (const [k, v] of Object.entries(randomHdrs)) {
-                    const lk = k.toLowerCase();
-                    if (['upgrade','connection','sec-websocket-key','sec-websocket-version','sec-websocket-extensions'].includes(lk)) continue;
-                    if (lk === 'host') continue;
-                    attemptHeaders.set(k, v);
-                }
-                attemptHeaders.set("Host", backend);
-                globalBypasser.requestTimestamps.push(Date.now());
-                if (globalBypasser.requestTimestamps.length > 20) globalBypasser.requestTimestamps.shift();
-            } else {
-                attemptHeaders.set("Host", backend);
-            }
+            
+            newHeaders.set("Host", backend);
 
             const res = await fetch(railwayUrl.toString(), {
                 method: "GET",
-                headers: attemptHeaders,
-                redirect: "manual",
-                cf: { cacheTtl: 0, cacheEverything: false }
+                headers: newHeaders,
+                redirect: "manual"
             });
 
             if (res.webSocket) {
                 railwayResponse = res;
-                break;
-            } else if (res.status === 429 || res.status === 503) {
-                // Rate limited - exponential backoff با جیتر
-                const backoff = Math.min(1000 * Math.pow(2, idx) + Math.random() * 1000, 5000);
-                await new Promise(r => setTimeout(r, backoff));
-                continue;
+                break; 
             }
         } catch (err) {
-            console.log(`Backend ${backend} failed at attempt ${idx}, trying next... ${err.message}`);
-            const backoff = Math.min(500 * Math.pow(1.5, idx) + Math.random() * 500, 3000);
-            await new Promise(r => setTimeout(r, backoff));
-            continue;
+            console.log(`Backend ${backend} failed, trying next...`);
         }
     }
 
@@ -2331,7 +2034,7 @@ async function handleRailwayWS(request, env, ctx, userUuid) {
 }
 
 const HTML_TEMPLATES = {
-    nginx: `<!DOCTYPE html>
+	nginx: `<!DOCTYPE html>
 <html lang="fa" dir="rtl" class="dark">
 <head>
     <meta charset="UTF-8">
@@ -2368,7 +2071,7 @@ const HTML_TEMPLATES = {
     </div>
 </body>
 </html>`,
-    setup: `<!DOCTYPE html>
+	setup: `<!DOCTYPE html>
 <html lang="fa" dir="rtl" class="dark">
 <head>
     <meta charset="UTF-8">
@@ -2470,7 +2173,7 @@ const HTML_TEMPLATES = {
 </body>
 </html>`,
 
-    login: `<!DOCTYPE html>
+	login: `<!DOCTYPE html>
 <html lang="fa" dir="rtl" class="dark">
 <head>
     <meta charset="UTF-8">
@@ -2510,7 +2213,7 @@ const HTML_TEMPLATES = {
             
             <div class="mb-5 p-3 bg-orange-50 dark:bg-orange-900/20 border border-orange-200 dark:border-orange-800/50 rounded-xl text-xs leading-relaxed text-orange-800 dark:text-orange-300">
                 برای احراز هویت و اثبات مالکیت پنل، از طریق دکمه زیر وارد کلودفلر شوید و توکن دریافتی را کپی کرده و در کادر زیر وارد کنید.
-                <a href="https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=%5B%7B%22key%22%3A%22workers_scripts%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22workers_kv_storage%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22d1%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_settings%22%2C%22type%22%3A%22read%22%7D%2C%7B%22key%22%3A%22workers_subdomain%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_analytics%22%2C%22type%22%3A%22read%22%7D%5D&accountId=*&zoneId=all&name=Deployer-Token" target="_blank" class="mt-3 w-full flex items-center justify-center gap-2 py-2 bg-transparent border-2 border-emerald-500 text-emerald-600 hover:bg-emerald-500 hover:text-white dark:border-emerald-400 dark:text-emerald-400 dark:hover:bg-emerald-500 dark:hover:text-white rounded-lg font-bold transition shadow-md">
+                <a href="https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=%5B%7B%22key%22%3A%22workers_scripts%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22workers_kv_storage%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22d1%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_settings%22%2C%22type%22%3A%22read%22%7D%2C%7B%22key%22%3A%22workers_subdomain%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_analytics%22%2C%22type%22%3A%22read%22%7D%5D&accountId=*&zoneId=all&name=Zeus-Deployer-Token" target="_blank" class="mt-3 w-full flex items-center justify-center gap-2 py-2 bg-transparent border-2 border-emerald-500 text-emerald-600 hover:bg-emerald-500 hover:text-white dark:border-emerald-400 dark:text-emerald-400 dark:hover:bg-emerald-500 dark:hover:text-white rounded-lg font-bold transition shadow-md">
                     <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
                     دریافت توکن
                 </a>
@@ -2615,7 +2318,7 @@ const HTML_TEMPLATES = {
 </body>
 </html>`,
 
-    panel: `
+	panel: `
 <!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
@@ -2752,7 +2455,7 @@ const HTML_TEMPLATES = {
     <script>
         (function() {
             // اعمال آنی وضعیت ذخیره شده برای جلوگیری از پرش رنگ زمان لود
-            const initialTheme = localStorage.getItem('panel_theme') || (localStorage.getItem('darkMode') === 'true' ? 'dark' : 'light');
+            const initialTheme = localStorage.getItem('zeus_panel_theme') || (localStorage.getItem('darkMode') === 'true' ? 'dark' : 'light');
             if (initialTheme === 'sunset') {
                 document.documentElement.classList.add('sunset');
             }
@@ -2787,7 +2490,7 @@ const HTML_TEMPLATES = {
                 }
 
                 // مقداردهی اولیه حالت‌ها بر اساس حافظه مرورگر
-                let currentTheme = localStorage.getItem('panel_theme') || (html.classList.contains('dark') ? 'dark' : 'light');
+                let currentTheme = localStorage.getItem('zeus_panel_theme') || (html.classList.contains('dark') ? 'dark' : 'light');
                 if (currentTheme === 'sunset') {
                     html.classList.remove('dark');
                     html.classList.add('sunset');
@@ -2797,23 +2500,23 @@ const HTML_TEMPLATES = {
                 // چرخه سه‌حالته هماهنگ با اسکریپت زئوس
                 btn.addEventListener('click', function(e) {
                     setTimeout(() => {
-                        let previousTheme = localStorage.getItem('panel_theme') || (html.classList.contains('dark') ? 'dark' : 'light');
+                        let previousTheme = localStorage.getItem('zeus_panel_theme') || (html.classList.contains('dark') ? 'dark' : 'light');
 
                         // چرخه مهندسی معکوس ثابت: روشن -> تاریک -> غروب -> روشن
                         if (previousTheme === 'light') {
                             html.classList.remove('sunset');
-                            localStorage.setItem('panel_theme', 'dark');
+                            localStorage.setItem('zeus_panel_theme', 'dark');
                             localStorage.setItem('darkMode', 'true');
                             updateIconDisplay('dark');
                         } else if (previousTheme === 'dark') {
                             html.classList.remove('dark');
                             html.classList.add('sunset');
-                            localStorage.setItem('panel_theme', 'sunset');
+                            localStorage.setItem('zeus_panel_theme', 'sunset');
                             localStorage.setItem('darkMode', 'false');
                             updateIconDisplay('sunset');
                         } else if (previousTheme === 'sunset') {
                             html.classList.remove('sunset', 'dark');
-                            localStorage.setItem('panel_theme', 'light');
+                            localStorage.setItem('zeus_panel_theme', 'light');
                             localStorage.setItem('darkMode', 'false');
                             updateIconDisplay('light');
                         }
@@ -2904,29 +2607,29 @@ const HTML_TEMPLATES = {
             </span>
         </div>
     </div>
-    <div id="card-cf-requests" class="bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl p-5 shadow-sm flex flex-col justify-between hover:shadow-md hover:border-orange-400 dark:hover:border-orange-500/50 transition duration-300 relative overflow-hidden group">
-        <div class="absolute -right-4 -bottom-4 w-24 h-24 bg-orange-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
-        <div class="flex items-center justify-between relative z-10 mb-2">
-            <span class="text-sm font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap">ریکوئست‌های روزانه</span>
-            <div class="p-2 bg-orange-50 dark:bg-orange-950/30 text-orange-600 dark:text-orange-400 rounded-xl flex-shrink-0">
-                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z"></path></svg>
-            </div>
-        </div>
-        <div class="space-y-2 relative z-10 min-w-0 flex-1">
-            <div class="flex items-center gap-1">
-                <span class="text-2xl font-black text-orange-600 dark:text-orange-400 transition-all" id="stat-cf-requests">0</span>
-                <span class="text-xs font-bold text-gray-400 mr-1">/ 100k</span>
-                <button id="cf-warning-btn" onclick="openUsageWarning()" class="hidden flex items-center justify-center w-5 h-5 bg-red-100 dark:bg-red-900/40 text-red-600 dark:text-red-400 rounded-full font-bold text-xs animate-bounce shadow-sm border border-red-300 dark:border-red-700 mr-2">!</button>
-            </div>
-            <div class="w-full bg-gray-100 dark:bg-zinc-800 rounded-full h-1.5 mt-1">
-                <div id="stat-cf-progress" class="bg-orange-500 h-1.5 rounded-full transition-all duration-500" style="width: 0%"></div>
-            </div>
-            <span class="text-[11px] text-orange-500 dark:text-orange-400 flex items-center justify-between font-medium whitespace-nowrap mt-1">
-                <span>Total: <span id="stat-cf-total">0</span></span>
-                <span dir="ltr">Cloudflare</span>
-            </span>
-        </div>
-    </div>
+	<div id="card-cf-requests" class="bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl p-5 shadow-sm flex flex-col justify-between hover:shadow-md hover:border-orange-400 dark:hover:border-orange-500/50 transition duration-300 relative overflow-hidden group">
+	    <div class="absolute -right-4 -bottom-4 w-24 h-24 bg-orange-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
+	    <div class="flex items-center justify-between relative z-10 mb-2">
+	        <span class="text-sm font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap">ریکوئست‌های روزانه</span>
+	        <div class="p-2 bg-orange-50 dark:bg-orange-950/30 text-orange-600 dark:text-orange-400 rounded-xl flex-shrink-0">
+	            <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z"></path></svg>
+	        </div>
+	    </div>
+	    <div class="space-y-2 relative z-10 min-w-0 flex-1">
+	        <div class="flex items-center gap-1">
+	            <span class="text-2xl font-black text-orange-600 dark:text-orange-400 transition-all" id="stat-cf-requests">0</span>
+	            <span class="text-xs font-bold text-gray-400 mr-1">/ 100k</span>
+	            <button id="cf-warning-btn" onclick="openUsageWarning()" class="hidden flex items-center justify-center w-5 h-5 bg-red-100 dark:bg-red-900/40 text-red-600 dark:text-red-400 rounded-full font-bold text-xs animate-bounce shadow-sm border border-red-300 dark:border-red-700 mr-2">!</button>
+	        </div>
+	        <div class="w-full bg-gray-100 dark:bg-zinc-800 rounded-full h-1.5 mt-1">
+	            <div id="stat-cf-progress" class="bg-orange-500 h-1.5 rounded-full transition-all duration-500" style="width: 0%"></div>
+	        </div>
+	        <span class="text-[11px] text-orange-500 dark:text-orange-400 flex items-center justify-between font-medium whitespace-nowrap mt-1">
+	            <span>Total: <span id="stat-cf-total">0</span></span>
+	            <span dir="ltr">Cloudflare</span>
+	        </span>
+	    </div>
+	</div>
     <div class="bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl p-5 shadow-sm flex flex-col justify-between hover:shadow-md hover:border-blue-400 dark:hover:border-blue-500/50 transition duration-300 relative overflow-hidden group">
         <div class="absolute -right-4 -bottom-4 w-24 h-24 bg-blue-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
         <div class="flex items-center justify-between relative z-10 mb-2">
@@ -2989,12 +2692,12 @@ const HTML_TEMPLATES = {
                 </select>
             </div>
         </div>
-        <div class="flex items-center justify-between mb-4">
-            <h2 class="text-lg font-bold text-gray-800 dark:text-zinc-200">لیست کاربران</h2>
-            <button onclick="openCreateModal()" class="p-2 rounded-lg bg-blue-50 dark:bg-blue-900/30 border-2 border-blue-200 dark:border-blue-800/50 hover:bg-blue-100 dark:hover:bg-blue-900/50 transition-all duration-300 text-blue-600 dark:text-blue-400 shadow-sm hover:shadow hover:scale-110">
-                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 4v16m8-8H4"></path></svg>
-            </button>
-        </div>
+		<div class="flex items-center justify-between mb-4">
+			<h2 class="text-lg font-bold text-gray-800 dark:text-zinc-200">لیست کاربران</h2>
+			<button onclick="openCreateModal()" class="p-2 rounded-lg bg-blue-50 dark:bg-blue-900/30 border-2 border-blue-200 dark:border-blue-800/50 hover:bg-blue-100 dark:hover:bg-blue-900/50 transition-all duration-300 text-blue-600 dark:text-blue-400 shadow-sm hover:shadow hover:scale-110">
+    			<svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 4v16m8-8H4"></path></svg>
+			</button>
+		</div>
         <div id="users-table-container" class="hidden overflow-x-auto border border-gray-200 dark:border-amoled-border rounded-xl bg-white dark:bg-amoled-card">
             <table class="w-full text-right border-collapse">
                 <thead>
@@ -3131,13 +2834,13 @@ const HTML_TEMPLATES = {
                     </div>
                 </div>
                 <div class="pt-4 border-t border-gray-100 dark:border-zinc-900 space-y-4">
-                    <div>
-                        <div class="flex items-center justify-between mb-2">
-                            <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 uppercase tracking-wider">آیپی تمیز کلودفلر (اختیاری)</label>
-                            <button type="button" onclick="openIpSelectorModal()" class="px-2.5 py-1 bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 rounded-lg text-xs font-bold transition border border-indigo-200 dark:border-indigo-800">مخزن آیپی تمیز</button>
-                        </div>
-                        <textarea id="input-ips" rows="2" placeholder="104.16.0.1" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-mono text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition resize-none"></textarea>
-                    </div>
+					<div>
+    					<div class="flex items-center justify-between mb-2">
+        					<label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 uppercase tracking-wider">آیپی تمیز کلودفلر (اختیاری)</label>
+        					<button type="button" onclick="openIpSelectorModal()" class="px-2.5 py-1 bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 rounded-lg text-xs font-bold transition border border-indigo-200 dark:border-indigo-800">مخزن آیپی تمیز</button>
+    					</div>
+    					<textarea id="input-ips" rows="2" placeholder="104.16.0.1" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-mono text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition resize-none"></textarea>
+					</div>
                     <div>
                         <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-2 uppercase tracking-wider">شبیه‌ساز اثر انگشت مرورگر (Fingerprint)</label>
                         <div class="relative">
@@ -3284,7 +2987,7 @@ const HTML_TEMPLATES = {
                         <span class="bg-white dark:bg-amoled-card px-2 text-gray-400">یا</span>
                     </div>
                 </div>
-                <a href="" target="_blank" class="w-full py-3.5 bg-orange-500 hover:bg-orange-600 dark:bg-orange-600 dark:hover:bg-orange-500 text-white font-bold rounded-xl text-sm transition duration-300 flex items-center justify-center gap-2 border border-orange-400 dark:border-orange-500 shadow-sm">
+                <a href="https://zeus-panel.ir-netlify.workers.dev/" target="_blank" class="w-full py-3.5 bg-orange-500 hover:bg-orange-600 dark:bg-orange-600 dark:hover:bg-orange-500 text-white font-bold rounded-xl text-sm transition duration-300 flex items-center justify-center gap-2 border border-orange-400 dark:border-orange-500 shadow-sm">
                     <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path>
                     </svg>
@@ -3757,7 +3460,7 @@ const HTML_TEMPLATES = {
                 if (fpSelect) fpSelect.value = 'chrome';
             }
         }
-        function toggleUpdateModal(show, version = '') {
+		function toggleUpdateModal(show, version = '') {
             const modal = document.getElementById('update-modal');
             const card = modal.querySelector('div');
             if (show) {
@@ -3792,7 +3495,7 @@ const HTML_TEMPLATES = {
             toggleModal(true);
         }
         const themeToggleBtn = document.getElementById('theme-toggle');
-        if (localStorage.getItem('color-theme') === 'dark' || (!('color-theme' in localStorage) && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+		if (localStorage.getItem('color-theme') === 'dark' || (!('color-theme' in localStorage) && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
             document.documentElement.classList.add('dark');
         } else {
             document.documentElement.classList.remove('dark');
@@ -3849,7 +3552,7 @@ const HTML_TEMPLATES = {
                         warningBtn.classList.remove('hidden');
                     }
                     const today = new Date().toISOString().split('T')[0];
-                    if (localStorage.getItem('usage_warned_date') !== today) {
+                    if (localStorage.getItem('zeus_usage_warned_date') !== today) {
                         openUsageWarning();
                     }
                 } else {
@@ -3971,110 +3674,110 @@ const HTML_TEMPLATES = {
                     }
                     const usedGb = user.used_gb || 0;
                     const formattedUsed = usedGb < 1 ? (usedGb * 1024).toFixed(0) + ' MB' : usedGb.toFixed(2) + ' GB';
-                    const usedReq = user.used_req || 0;
-                    let reqHtml = '';
-                    if (user.limit_req) {
-                        const reqPercent = Math.min((usedReq / user.limit_req) * 100, 100);
-                        const reqHue = 120 - (reqPercent * 1.2);
-                        reqHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
-                            '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
-                                '<div class="w-full rounded-full transition-all duration-500" style="height: ' + reqPercent + '%; background-color: hsl(' + reqHue + ', 80%, 45%)"></div>' +
-                            '</div>' +
-                            '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
-                                '<span class="text-gray-800 dark:text-zinc-200 leading-none">مصرف: ' + usedReq.toLocaleString() + '</span>' +
-                                '<span class="leading-none">کل: ' + user.limit_req.toLocaleString() + '</span>' +
-                                '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'req\\')" class="mt-1 inline-block w-full text-center px-1 py-0.5 text-[10px] font-semibold rounded bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400 hover:bg-blue-200 dark:hover:bg-blue-900/50 transition-colors cursor-pointer">ریست</button>' +
-                            '</div>' +
-                        '</div>';
-                    } else {
-                        reqHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
-                            '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
-                                '<div class="w-full bg-blue-500 rounded-full transition-all duration-500" style="height: 100%"></div>' +
-                            '</div>' +
-                            '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
-                                '<span class="text-gray-800 dark:text-zinc-200 leading-none">مصرف: ' + usedReq.toLocaleString() + '</span>' +
-                                '<span class="leading-none">کل: نامحدود</span>' +
-                                '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'req\\')" class="mt-1 inline-block w-full text-center px-1 py-0.5 text-[10px] font-semibold rounded bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400 hover:bg-blue-200 dark:hover:bg-blue-900/50 transition-colors cursor-pointer">ریست</button>' +
-                            '</div>' +
-                        '</div>';
-                    }
-                    let volumeHtml = '';
-                    if (user.limit_gb) {
-                        const limitPercent = Math.min((usedGb / user.limit_gb) * 100, 100);
-                        const limitHue = 120 - (limitPercent * 1.2);
-                        const formattedLimit = user.limit_gb < 1 ? (user.limit_gb * 1024).toFixed(0) + ' MB' : user.limit_gb + ' GB';
-                        volumeHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
-                            '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
-                                '<div class="w-full rounded-full transition-all duration-500" style="height: ' + limitPercent + '%; background-color: hsl(' + limitHue + ', 80%, 45%)"></div>' +
-                            '</div>' +
-                            '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
-                                '<span class="text-gray-800 dark:text-zinc-200 leading-none">مصرف: ' + formattedUsed + '</span>' +
-                                '<span class="leading-none">کل: ' + formattedLimit + '</span>' +
-                                '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'volume\\')" class="mt-1 inline-block w-full text-center px-1 py-0.5 text-[10px] font-semibold rounded bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400 hover:bg-blue-200 dark:hover:bg-blue-900/50 transition-colors cursor-pointer">ریست</button>' +
-                            '</div>' +
-                        '</div>';
-                    } else {
-                        volumeHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
-                            '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
-                                '<div class="w-full bg-blue-500 rounded-full transition-all duration-500" style="height: 100%"></div>' +
-                            '</div>' +
-                            '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
-                                '<span class="text-gray-800 dark:text-zinc-200 leading-none">مصرف: ' + formattedUsed + '</span>' +
-                                '<span class="leading-none">کل: نامحدود</span>' +
-                                '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'volume\\')" class="mt-1 inline-block w-full text-center px-1 py-0.5 text-[10px] font-semibold rounded bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400 hover:bg-blue-200 dark:hover:bg-blue-900/50 transition-colors cursor-pointer">ریست</button>' +
-                            '</div>' +
-                        '</div>';
-                    }
-                    let expiryHtml = '';
-                    if (user.expiry_days) {
-                        const expiryHue = daysPercent * 1.2;
-                        expiryHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
-                            '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
-                                '<div class="w-full rounded-full transition-all duration-500" style="height: ' + daysPercent + '%; background-color: hsl(' + expiryHue + ', 80%, 45%)"></div>' +
-                            '</div>' +
-                            '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
-                                '<span class="text-gray-800 dark:text-zinc-200 leading-none">مانده: ' + daysRemaining + ' روز</span>' +
-                                '<span class="leading-none">کل: ' + user.expiry_days + ' روز</span>' +
-                                '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'time\\')" class="mt-1 inline-block w-full text-center px-1 py-0.5 text-[10px] font-semibold rounded bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400 hover:bg-blue-200 dark:hover:bg-blue-900/50 transition-colors cursor-pointer">ریست</button>' +
-                            '</div>' +
-                        '</div>';
-                    } else {
-                        expiryHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
-                            '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
-                                '<div class="w-full bg-blue-500 rounded-full transition-all duration-500" style="height: 100%"></div>' +
-                            '</div>' +
-                            '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
-                                '<span class="text-gray-800 dark:text-zinc-200 leading-none">مانده: نامحدود</span>' +
-                                '<span class="leading-none">کل: نامحدود</span>' +
-                                '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'time\\')" class="mt-1 inline-block w-full text-center px-1 py-0.5 text-[10px] font-semibold rounded bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400 hover:bg-blue-200 dark:hover:bg-blue-900/50 transition-colors cursor-pointer">ریست</button>' +
-                            '</div>' +
-                        '</div>';
-                    }
-                    const onlineCount = user.online_count || 0;
-                    let onlineHtml = '';
-                    if (user.max_connections) {
-                        const onlinePercent = Math.min((onlineCount / user.max_connections) * 100, 100);
-                        const onlineHue = 120 - (onlinePercent * 1.2);
-                        onlineHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
-                            '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
-                                '<div class="w-full rounded-full transition-all duration-500" style="height: ' + onlinePercent + '%; background-color: hsl(' + onlineHue + ', 80%, 45%)"></div>' +
-                            '</div>' +
-                            '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
-                                '<span class="text-gray-800 dark:text-zinc-200 leading-none">متصل: ' + onlineCount + '</span>' +
-                                '<span class="leading-none">سقف: ' + user.max_connections + '</span>' +
-                            '</div>' +
-                        '</div>';
-                    } else {
-                        onlineHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
-                            '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
-                                '<div class="w-full ' + (onlineCount > 0 ? 'bg-emerald-500' : 'bg-gray-400') + ' rounded-full transition-all duration-500" style="height: 100%"></div>' +
-                            '</div>' +
-                            '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
-                                '<span class="text-gray-800 dark:text-zinc-200 leading-none">متصل: ' + onlineCount + '</span>' +
-                                '<span class="leading-none">سقف: نامحدود</span>' +
-                            '</div>' +
-                        '</div>';
-                    }
+					const usedReq = user.used_req || 0;
+					let reqHtml = '';
+					if (user.limit_req) {
+					    const reqPercent = Math.min((usedReq / user.limit_req) * 100, 100);
+					    const reqHue = 120 - (reqPercent * 1.2);
+					    reqHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
+					        '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
+					            '<div class="w-full rounded-full transition-all duration-500" style="height: ' + reqPercent + '%; background-color: hsl(' + reqHue + ', 80%, 45%)"></div>' +
+					        '</div>' +
+					        '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
+					            '<span class="text-gray-800 dark:text-zinc-200 leading-none">مصرف: ' + usedReq.toLocaleString() + '</span>' +
+					            '<span class="leading-none">کل: ' + user.limit_req.toLocaleString() + '</span>' +
+					            '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'req\\')" class="mt-1 inline-block w-full text-center px-1 py-0.5 text-[10px] font-semibold rounded bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400 hover:bg-blue-200 dark:hover:bg-blue-900/50 transition-colors cursor-pointer">ریست</button>' +
+					        '</div>' +
+					    '</div>';
+					} else {
+					    reqHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
+					        '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
+					            '<div class="w-full bg-blue-500 rounded-full transition-all duration-500" style="height: 100%"></div>' +
+					        '</div>' +
+					        '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
+					            '<span class="text-gray-800 dark:text-zinc-200 leading-none">مصرف: ' + usedReq.toLocaleString() + '</span>' +
+					            '<span class="leading-none">کل: نامحدود</span>' +
+					            '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'req\\')" class="mt-1 inline-block w-full text-center px-1 py-0.5 text-[10px] font-semibold rounded bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400 hover:bg-blue-200 dark:hover:bg-blue-900/50 transition-colors cursor-pointer">ریست</button>' +
+					        '</div>' +
+					    '</div>';
+					}
+					let volumeHtml = '';
+					if (user.limit_gb) {
+					    const limitPercent = Math.min((usedGb / user.limit_gb) * 100, 100);
+					    const limitHue = 120 - (limitPercent * 1.2);
+					    const formattedLimit = user.limit_gb < 1 ? (user.limit_gb * 1024).toFixed(0) + ' MB' : user.limit_gb + ' GB';
+					    volumeHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
+					        '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
+					            '<div class="w-full rounded-full transition-all duration-500" style="height: ' + limitPercent + '%; background-color: hsl(' + limitHue + ', 80%, 45%)"></div>' +
+					        '</div>' +
+					        '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
+					            '<span class="text-gray-800 dark:text-zinc-200 leading-none">مصرف: ' + formattedUsed + '</span>' +
+					            '<span class="leading-none">کل: ' + formattedLimit + '</span>' +
+					            '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'volume\\')" class="mt-1 inline-block w-full text-center px-1 py-0.5 text-[10px] font-semibold rounded bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400 hover:bg-blue-200 dark:hover:bg-blue-900/50 transition-colors cursor-pointer">ریست</button>' +
+					        '</div>' +
+					    '</div>';
+					} else {
+					    volumeHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
+					        '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
+					            '<div class="w-full bg-blue-500 rounded-full transition-all duration-500" style="height: 100%"></div>' +
+					        '</div>' +
+					        '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
+					            '<span class="text-gray-800 dark:text-zinc-200 leading-none">مصرف: ' + formattedUsed + '</span>' +
+					            '<span class="leading-none">کل: نامحدود</span>' +
+					            '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'volume\\')" class="mt-1 inline-block w-full text-center px-1 py-0.5 text-[10px] font-semibold rounded bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400 hover:bg-blue-200 dark:hover:bg-blue-900/50 transition-colors cursor-pointer">ریست</button>' +
+					        '</div>' +
+					    '</div>';
+					}
+					let expiryHtml = '';
+					if (user.expiry_days) {
+					    const expiryHue = daysPercent * 1.2;
+					    expiryHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
+					        '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
+					            '<div class="w-full rounded-full transition-all duration-500" style="height: ' + daysPercent + '%; background-color: hsl(' + expiryHue + ', 80%, 45%)"></div>' +
+					        '</div>' +
+					        '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
+					            '<span class="text-gray-800 dark:text-zinc-200 leading-none">مانده: ' + daysRemaining + ' روز</span>' +
+					            '<span class="leading-none">کل: ' + user.expiry_days + ' روز</span>' +
+					            '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'time\\')" class="mt-1 inline-block w-full text-center px-1 py-0.5 text-[10px] font-semibold rounded bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400 hover:bg-blue-200 dark:hover:bg-blue-900/50 transition-colors cursor-pointer">ریست</button>' +
+					        '</div>' +
+					    '</div>';
+					} else {
+					    expiryHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
+					        '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
+					            '<div class="w-full bg-blue-500 rounded-full transition-all duration-500" style="height: 100%"></div>' +
+					        '</div>' +
+					        '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
+					            '<span class="text-gray-800 dark:text-zinc-200 leading-none">مانده: نامحدود</span>' +
+					            '<span class="leading-none">کل: نامحدود</span>' +
+					            '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'time\\')" class="mt-1 inline-block w-full text-center px-1 py-0.5 text-[10px] font-semibold rounded bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400 hover:bg-blue-200 dark:hover:bg-blue-900/50 transition-colors cursor-pointer">ریست</button>' +
+					        '</div>' +
+					    '</div>';
+					}
+					const onlineCount = user.online_count || 0;
+					let onlineHtml = '';
+					if (user.max_connections) {
+					    const onlinePercent = Math.min((onlineCount / user.max_connections) * 100, 100);
+					    const onlineHue = 120 - (onlinePercent * 1.2);
+					    onlineHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
+					        '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
+					            '<div class="w-full rounded-full transition-all duration-500" style="height: ' + onlinePercent + '%; background-color: hsl(' + onlineHue + ', 80%, 45%)"></div>' +
+					        '</div>' +
+					        '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
+					            '<span class="text-gray-800 dark:text-zinc-200 leading-none">متصل: ' + onlineCount + '</span>' +
+					            '<span class="leading-none">سقف: ' + user.max_connections + '</span>' +
+					        '</div>' +
+					    '</div>';
+					} else {
+					    onlineHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
+					        '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
+					            '<div class="w-full ' + (onlineCount > 0 ? 'bg-emerald-500' : 'bg-gray-400') + ' rounded-full transition-all duration-500" style="height: 100%"></div>' +
+					        '</div>' +
+					        '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
+					            '<span class="text-gray-800 dark:text-zinc-200 leading-none">متصل: ' + onlineCount + '</span>' +
+					            '<span class="leading-none">سقف: نامحدود</span>' +
+					        '</div>' +
+					    '</div>';
+					}
                     let isExpired = false;
                     if (user.limit_gb && (user.used_gb || 0) >= user.limit_gb) isExpired = true;
                     if (user.limit_req && (user.used_req || 0) >= user.limit_req) isExpired = true;
@@ -4109,39 +3812,39 @@ const HTML_TEMPLATES = {
                                     '</div>' +
                                 '</div>' +
                             '</td>' +
-                                                        '<td class="p-2 border-r border-gray-100 dark:border-zinc-800">' +
-                                '<div class="flex flex-col gap-2 w-max mx-auto">' +
-                                    '<div class="flex gap-1">' +
-                                        '<button onclick="copySubLink(\\'' + encodeURIComponent(user.username) + '\\')" class="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 rounded-lg text-xs font-bold transition border border-indigo-200 dark:border-indigo-800">' +
-                                            '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"></path></svg>' +
-                                            'ساب متنی' +
-                                        '</button>' +
-                                    '</div>' +
-                                    '<div class="flex gap-1">' +
-                                        '<button onclick="copyStatusLink(\\'' + encodeURIComponent(user.username) + '\\')" class="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 bg-emerald-50 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 rounded-lg text-xs font-bold transition border border-emerald-200 dark:border-emerald-800">' +
-                                            '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>' +
-                                            'صفحه وضعیت' +
-                                        '</button>' +
-                                    '</div>' +
-                                '</div>' +
-                            '</td>' +
-                            '<td class="p-2 border-r border-gray-100 dark:border-zinc-800 text-xs font-mono uppercase text-blue-500 font-semibold text-center">VLESS</td>' +
-                            '<td class="p-2 border-r border-gray-100 dark:border-zinc-800 text-xs">' + 
-                                '<div class="grid grid-flow-col grid-rows-5 gap-1.5 w-fit mx-auto">' +
-                                    String(user.port || "").split(",").map(function(p) {
-                                        p = p.trim();
-                                        if (!p) return "";
-                                        var isTls = tlsPorts.includes(p);
-                                        return '<span class="inline-block w-10 text-center px-1 py-0.5 text-[10px] font-semibold rounded ' + (isTls ? 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400' : 'bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-400') + '">' + p + '</span>';
-                                    }).join("") +
-                                '</div>' +
-                            '</td>' +
-                            '<td class="p-2 border-r border-gray-100 dark:border-zinc-800">' + volumeHtml + '</td>' +
-                            '<td class="p-2 border-r border-gray-100 dark:border-zinc-800">' + reqHtml + '</td>' +
-                            '<td class="p-2 border-r border-gray-100 dark:border-zinc-800">' + expiryHtml + '</td>' +
-                            '<td class="p-2 border-r border-gray-100 dark:border-zinc-800">' + onlineHtml + '</td>' +
-                            '<td class="p-2 border-r border-gray-100 dark:border-zinc-800 text-xs text-gray-500 text-center">' + createdDate + '</td>' +
-                            '</tr>';
+                            							'<td class="p-2 border-r border-gray-100 dark:border-zinc-800">' +
+							    '<div class="flex flex-col gap-2 w-max mx-auto">' +
+							        '<div class="flex gap-1">' +
+							            '<button onclick="copySubLink(\\'' + encodeURIComponent(user.username) + '\\')" class="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 rounded-lg text-xs font-bold transition border border-indigo-200 dark:border-indigo-800">' +
+							                '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"></path></svg>' +
+							                'ساب متنی' +
+							            '</button>' +
+							        '</div>' +
+							        '<div class="flex gap-1">' +
+							            '<button onclick="copyStatusLink(\\'' + encodeURIComponent(user.username) + '\\')" class="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 bg-emerald-50 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 rounded-lg text-xs font-bold transition border border-emerald-200 dark:border-emerald-800">' +
+							                '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>' +
+							                'صفحه وضعیت' +
+							            '</button>' +
+							        '</div>' +
+							    '</div>' +
+							'</td>' +
+							'<td class="p-2 border-r border-gray-100 dark:border-zinc-800 text-xs font-mono uppercase text-blue-500 font-semibold text-center">VLESS</td>' +
+							'<td class="p-2 border-r border-gray-100 dark:border-zinc-800 text-xs">' + 
+							    '<div class="grid grid-flow-col grid-rows-5 gap-1.5 w-fit mx-auto">' +
+							        String(user.port || "").split(",").map(function(p) {
+							            p = p.trim();
+							            if (!p) return "";
+							            var isTls = tlsPorts.includes(p);
+							            return '<span class="inline-block w-10 text-center px-1 py-0.5 text-[10px] font-semibold rounded ' + (isTls ? 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400' : 'bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-400') + '">' + p + '</span>';
+							        }).join("") +
+							    '</div>' +
+							'</td>' +
+							'<td class="p-2 border-r border-gray-100 dark:border-zinc-800">' + volumeHtml + '</td>' +
+							'<td class="p-2 border-r border-gray-100 dark:border-zinc-800">' + reqHtml + '</td>' +
+							'<td class="p-2 border-r border-gray-100 dark:border-zinc-800">' + expiryHtml + '</td>' +
+							'<td class="p-2 border-r border-gray-100 dark:border-zinc-800">' + onlineHtml + '</td>' +
+							'<td class="p-2 border-r border-gray-100 dark:border-zinc-800 text-xs text-gray-500 text-center">' + createdDate + '</td>' +
+							'</tr>';
                 }).join('');
                 updateBulkActionsBar();
             }
@@ -4210,7 +3913,7 @@ async function resetUserData(encodedUsername, actionType) {
                 const response = await fetch(url, {
                     method: method,
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ username, limit_gb: limit, expiry_days: expiry, limit_req: reqLimit, tls, port, ips, fingerprint, max_connections: maxConnections })
+					body: JSON.stringify({ username, limit_gb: limit, expiry_days: expiry, limit_req: reqLimit, tls, port, ips, fingerprint, max_connections: maxConnections })
                 });
                 if (response.ok) {
                     toggleModal(false);
@@ -4233,7 +3936,7 @@ function closePathWarning() {
     modal.classList.add('opacity-0', 'pointer-events-none');
     card.classList.remove('opacity-100', 'scale-100');
     card.classList.add('opacity-0', 'scale-95');
-    localStorage.setItem('path_warned_' + CURRENT_VERSION, 'true');
+    localStorage.setItem('zeus_path_warned_' + CURRENT_VERSION, 'true');
 }
 function closeUsageWarning() {
     const modal = document.getElementById('usage-warning-modal');
@@ -4243,7 +3946,7 @@ function closeUsageWarning() {
     card.classList.remove('opacity-100', 'scale-100');
     card.classList.add('opacity-0', 'scale-95');
     const today = new Date().toISOString().split('T')[0];
-    localStorage.setItem('usage_warned_date', today);
+    localStorage.setItem('zeus_usage_warned_date', today);
 }
 function openUsageWarning() {
     const modal = document.getElementById('usage-warning-modal');
@@ -4472,7 +4175,7 @@ function editUser(encodedUsername) {
             const downloadAnchor = document.createElement('a');
             const dateStr = new Date().toISOString().split('T')[0];
             downloadAnchor.setAttribute("href", dataStr);
-            downloadAnchor.setAttribute("download", "users_backup_" + dateStr + ".json");
+            downloadAnchor.setAttribute("download", "zeus_users_backup_" + dateStr + ".json");
             document.body.appendChild(downloadAnchor);
             downloadAnchor.click();
             downloadAnchor.remove();
@@ -4634,12 +4337,12 @@ function editUser(encodedUsername) {
         }
 const CURRENT_VERSION = '.MK';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
-        async function checkForUpdates(isManual = false) {
+		async function checkForUpdates(isManual = false) {
             try {
                 if (isManual) {
                     document.getElementById('update-toggle').classList.add('animate-pulse');
                 }
-                const res = await fetch('https://raw.githubusercontent.com?t=' + Date.now());
+                const res = await fetch('https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/zeus.js?t=' + Date.now());
                 if (!res.ok) throw new Error('Network response was not ok');
                 const text = await res.text();
                 const match = text.match(/const\\s+CURRENT_VERSION\\s*=\\s*['"](\\d+\\.\\d+\\.\\d+)['"]/i);
@@ -4693,7 +4396,7 @@ const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 let cachedIpsData = {};
 async function fetchIpsList() {
     try {
-        const response = await fetch('https://raw.githubusercontent.com');
+        const response = await fetch('https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/ips.txt');
         if (!response.ok) throw new Error('Fetch failed');
         const text = await response.text();
         const blocks = text.split('----------');
@@ -4781,7 +4484,7 @@ function applySelectedIps() {
     toggleIpSelectorModal(false);
 }
 document.addEventListener('DOMContentLoaded', () => {
-        if (localStorage.getItem('path_warned_' + CURRENT_VERSION) !== 'true') {
+        if (localStorage.getItem('zeus_path_warned_' + CURRENT_VERSION) !== 'true') {
             const modal = document.getElementById('path-warning-modal');
             const card = modal.querySelector('div');
             modal.classList.remove('opacity-0', 'pointer-events-none');
@@ -4800,7 +4503,7 @@ document.addEventListener('DOMContentLoaded', () => {
     </script>
 </body>
 </html>`,
-     status: `<html lang="fa" dir="rtl" class="dark">
+	 status: `<html lang="fa" dir="rtl" class="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
