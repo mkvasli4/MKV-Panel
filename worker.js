@@ -21,52 +21,6 @@ const RAILWAY_BACKENDS = [
     "seyed84-production.up.railway.app",
     "manvaslam-production-07a1.up.railway.app"
 ];
-
-// ===== ADVANCED: Transport & Stealth Config =====
-const SUPPORTED_TRANSPORTS = ['ws', 'xhttp', 'httpupgrade'];
-const XHTTP_EARLY_DATA_HEADER = 'sec-websocket-protocol';
-const MAX_EARLY_DATA_BYTES = 64 * 1024;
-const SUB_CACHE_TTL = 60; // subscription cache 60s edge
-const TRAFFIC_FLUSH_THRESHOLD_MB = 20; // increase from 10 to 20 to reduce DB writes
-const TRAFFIC_FLUSH_INTERVAL_MS = 120000; // 2 min
-const MAX_CACHE_ENTRIES = 5000;
-const STEALTH_PATHS = ["/Ma_Ke_Vaslim", "/railway-io/"]; // add random path acceptance later
-
-// ===== 🚀 بهبود اول: Load Balancer وزنی + سلامت =====
-const BACKEND_STATE = new Map(); // host -> { weight, healthy, responseTime, failures, successCount, lastCheck }
-const DB_BUFFER = [];
-const BUFFER_THRESHOLD = 50;
-const USER_SLIDING_WINDOW = new Map(); // username -> [timestamps]
-const USER_LEAKY_BUCKET = new Map(); // username -> { tokens, lastLeak }
-let cachedIpList = null;
-let ipCacheTime = 0;
-const IP_CACHE_TTL = 60 * 60 * 1000; // 1 ساعت
-let cachedIpConfig = null;
-let ipConfigCacheTime = 0;
-const IP_CONFIG_CACHE_TTL = 30 * 1000; // 30 ثانیه کش برای کانفیگ IP
-const IP_CONFIG_URL = "https://raw.githubusercontent.com/ircfspace/cf2dns/refs/heads/master/list.json";
-const LEAKY_BUCKET_CAPACITY = 20;
-const LEAKY_BUCKET_REFILL_PER_SEC = 1;
-const SLIDING_WINDOW_LIMIT = 120; // ریکوئست در دقیقه
-const SLIDING_WINDOW_MS = 60000;
-
-// Init backend state from RAILWAY_BACKENDS
-(function initBackendState(){
-    try {
-        for (const host of RAILWAY_BACKENDS) {
-            BACKEND_STATE.set(host, {
-                weight: 1,
-                healthy: true,
-                responseTime: 120,
-                failures: 0,
-                successCount: 0,
-                lastCheck: Date.now()
-            });
-        }
-    } catch {}
-})();
-
-
 const DNS_CACHE_TTL = 5 * 60 * 1000;
 const DOH_RESOLVER = "https://1.1.1.1/dns-query";
 const UPSTREAM_BUNDLE_TARGET_BYTES = 32 * 1024;
@@ -334,408 +288,11 @@ class RateLimitBypasser {
 // نمونه گلوبال - برای استفاده در تمام Worker
 const globalBypasser = new RateLimitBypasser();
 
-// ===== ADVANCED HELPERS: Transport detection & Bridging & Early Data =====
-
-function hasUpgradeRequest(request, requireWebSocket = true) {
-    const upgrade = (request.headers.get('Upgrade') || '').toLowerCase();
-    const connection = (request.headers.get('Connection') || '').toLowerCase();
-    if (!connection.includes('upgrade')) return false;
-    if (requireWebSocket) {
-        return upgrade === 'websocket';
-    }
-    // httpupgrade accepts any Upgrade value
-    return upgrade.length > 0;
-}
-
-function buildBackendUpgradeHeaders(request, overrideUpgrade = null) {
-    const headers = new Headers();
-    // Copy essential WS headers
-    const copyList = ['upgrade', 'connection', 'sec-websocket-key', 'sec-websocket-version', 'sec-websocket-extensions', 'sec-websocket-protocol', 'host'];
-    for (const name of copyList) {
-        const val = request.headers.get(name);
-        if (val) headers.set(name, val);
-    }
-    if (overrideUpgrade) headers.set('Upgrade', overrideUpgrade);
-    // Add bypass random headers (non-conflicting)
-    try {
-        if (typeof globalBypasser !== 'undefined') {
-            const rnd = globalBypasser.generateRandomHeaders();
-            for (const [k,v] of Object.entries(rnd)) {
-                const lk = k.toLowerCase();
-                if (copyList.includes(lk)) continue;
-                if (!headers.has(k)) headers.set(k, v);
-            }
-        }
-    } catch {}
-    return headers;
-}
-
-function closeSocketPair(ws1, ws2, code = 1000, reason = 'closed') {
-    try { if (ws1.readyState === 1 || ws1.readyState === 0) ws1.close(code, reason); } catch {}
-    try { if (ws2.readyState === 1 || ws2.readyState === 0) ws2.close(code, reason); } catch {}
-}
-
-function safeClose(ws, code = 1000, reason = '') {
-    try { if (ws && (ws.readyState === 1 || ws.readyState === 0)) ws.close(code, reason); } catch {}
-}
-
-function parseEarlyData(request) {
-    // XHTTP early data can be in ?ed=xxx (size hint) and Sec-WebSocket-Protocol header base64url
-    try {
-        const url = new URL(request.url);
-        const edHint = url.searchParams.get('ed');
-        const protoHeader = request.headers.get(XHTTP_EARLY_DATA_HEADER) || '';
-        // Some clients encode early data as base64url in second part of Sec-WebSocket-Protocol
-        // Format: "value, base64urlEarlyData" - we try to parse
-        let earlyData = null;
-        if (protoHeader.includes(',')) {
-            const parts = protoHeader.split(',');
-            const b64 = parts[parts.length - 1].trim();
-            // base64url decode
-            try {
-                // Pad base64
-                let padded = b64.replace(/-/g, '+').replace(/_/g, '/');
-                while (padded.length % 4) padded += '=';
-                const bin = atob(padded);
-                const bytes = new Uint8Array(bin.length);
-                for (let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
-                earlyData = bytes;
-                if (earlyData.byteLength > MAX_EARLY_DATA_BYTES) earlyData = earlyData.slice(0, MAX_EARLY_DATA_BYTES);
-            } catch {}
-        }
-        return { edHint: edHint ? parseInt(edHint) : 0, earlyData };
-    } catch {
-        return { edHint: 0, earlyData: null };
-    }
-}
-
-function isValidUUIDFormat(uuid) {
-    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(uuid);
-}
-
-function pruneCachesIfNeeded() {
-    try {
-        if (GLOBAL_TRAFFIC_CACHE.size > MAX_CACHE_ENTRIES) {
-            const keys = Array.from(GLOBAL_TRAFFIC_CACHE.keys()).slice(0, 1000);
-            for (const k of keys) GLOBAL_TRAFFIC_CACHE.delete(k);
-        }
-        if (DNS_CACHE.size > 1000) {
-            const keys = Array.from(DNS_CACHE.keys()).slice(0, 500);
-            for (const k of keys) DNS_CACHE.delete(k);
-        }
-        if (USER_REQ_CACHE.size > MAX_CACHE_ENTRIES) {
-            const keys = Array.from(USER_REQ_CACHE.keys()).slice(0, 1000);
-            for (const k of keys) USER_REQ_CACHE.delete(k);
-        }
-        if (USER_SLIDING_WINDOW.size > MAX_CACHE_ENTRIES) {
-            const keys = Array.from(USER_SLIDING_WINDOW.keys()).slice(0, 1000);
-            for (const k of keys) USER_SLIDING_WINDOW.delete(k);
-        }
-        if (USER_LEAKY_BUCKET.size > MAX_CACHE_ENTRIES) {
-            const keys = Array.from(USER_LEAKY_BUCKET.keys()).slice(0, 1000);
-            for (const k of keys) USER_LEAKY_BUCKET.delete(k);
-        }
-        // prune DB buffer if too old (older than 5 min)
-        const fiveMinAgo = Date.now() - 5*60*1000;
-        for (let i=DB_BUFFER.length-1;i>=0;i--) {
-            if (DB_BUFFER[i].ts < fiveMinAgo) DB_BUFFER.splice(i,1);
-        }
-        // backend state: reset unhealthy after 5 min
-        const now = Date.now();
-        for (const [host, state] of BACKEND_STATE.entries()) {
-            if (!state.healthy && now - state.lastCheck > 300000) {
-                state.healthy = true;
-                state.failures = 0;
-            }
-        }
-    } catch {}
-}
-
-// Enhanced bridge for all transports
-function bridgeSocketsWithCounter(workerSocket, backendSocket, onBytes, onClose) {
-    // reuse existing createWsStream + TransformStream pattern but with error guards
-    const createWsStream = (ws) => {
-        const readable = new ReadableStream({
-            start(controller) {
-                const onMessage = (e) => {
-                    try { controller.enqueue(e.data); } catch {}
-                };
-                const onClose = () => { try { controller.close(); } catch {} };
-                const onError = (e) => { try { controller.error(e); } catch {} };
-                ws.addEventListener("message", onMessage);
-                ws.addEventListener("close", onClose);
-                ws.addEventListener("error", onError);
-            },
-            cancel() { try { ws.close(); } catch {} }
-        });
-        const writable = new WritableStream({
-            write(chunk) {
-                if (ws.readyState === 1) {
-                    try { ws.send(chunk); } catch {}
-                }
-            },
-            close() { try { ws.close(); } catch {} },
-            abort() { try { ws.close(); } catch {} }
-        });
-        return { readable, writable };
-    };
-
-    const createCounter = () => new TransformStream({
-        transform(chunk, controller) {
-            try {
-                const bytes = chunk.byteLength || chunk.length || 0;
-                if (typeof onBytes === 'function' && bytes>0) onBytes(bytes);
-            } catch {}
-            controller.enqueue(chunk);
-        }
-    });
-
-    try {
-        const localStream = createWsStream(workerSocket);
-        const remoteStream = createWsStream(backendSocket);
-
-        localStream.readable.pipeThrough(createCounter()).pipeTo(remoteStream.writable).catch(()=>{});
-        remoteStream.readable.pipeThrough(createCounter()).pipeTo(localStream.writable).catch(()=>{});
-
-        const cleanup = () => { if (typeof onClose === 'function') onClose(); };
-        workerSocket.addEventListener("close", cleanup);
-        backendSocket.addEventListener("close", cleanup);
-        workerSocket.addEventListener("error", cleanup);
-        backendSocket.addEventListener("error", cleanup);
-    } catch (e) {
-        console.error("bridgeSockets error", e.message);
-        safeClose(workerSocket); safeClose(backendSocket);
-    }
-}
-
-// Select backend with rotation + health awareness
-function selectBackendRoundRobin(attemptIndex = 0) {
-    if (!RAILWAY_BACKENDS.length) return null;
-    // use globalBypasser jitter for rotation
-    const idx = attemptIndex % RAILWAY_BACKENDS.length;
-    return RAILWAY_BACKENDS[idx];
-}
-
-// ----- Load Balancer پیشرفته -----
-function getHealthyBackend() {
-    const now = Date.now();
-    const healthy = Array.from(BACKEND_STATE.entries())
-        .filter(([host, state]) => {
-            if (!state.healthy) {
-                // اگر 30 ثانیه گذشته، دوباره سالم در نظر بگیر برای تست
-                if (now - state.lastCheck > 30000) {
-                    state.healthy = true;
-                    state.failures = 0;
-                    return true;
-                }
-                return false;
-            }
-            return true;
-        })
-        .sort((a,b) => {
-            // وزن + زمان پاسخ: امتیاز کمتر = بهتر
-            const scoreA = a[1].responseTime / (a[1].weight || 1);
-            const scoreB = b[1].responseTime / (b[1].weight || 1);
-            return scoreA - scoreB;
-        });
-    if (healthy.length === 0) return null;
-    return healthy[0][0];
-}
-
-function getAllHealthyBackendsSorted() {
-    const now = Date.now();
-    const list = Array.from(BACKEND_STATE.entries())
-        .filter(([_, s]) => s.healthy || (now - s.lastCheck > 30000))
-        .sort((a,b) => (a[1].responseTime / (a[1].weight||1)) - (b[1].responseTime / (b[1].weight||1)))
-        .map(([h])=>h);
-    return list.length ? list : [...RAILWAY_BACKENDS];
-}
-
-function updateBackendHealth(host, success, responseTime = 0) {
-    try {
-        let state = BACKEND_STATE.get(host);
-        if (!state) {
-            state = { weight:1, healthy:true, responseTime:120, failures:0, successCount:0, lastCheck:Date.now() };
-            BACKEND_STATE.set(host, state);
-        }
-        if (success) {
-            state.successCount++;
-            state.failures = 0;
-            state.healthy = true;
-            // EWMA برای زمان پاسخ
-            state.responseTime = state.responseTime * 0.7 + responseTime * 0.3;
-            // افزایش وزن در صورت موفقیت مداوم (تا سقف 5)
-            if (state.successCount > 10 && state.weight < 5) state.weight = Math.min(5, state.weight + 0.1);
-            state.lastCheck = Date.now();
-        } else {
-            state.failures++;
-            state.successCount = 0;
-            if (state.failures >= 3) {
-                state.healthy = false;
-                state.lastCheck = Date.now();
-                if (state.weight > 0.5) state.weight -= 0.2;
-            }
-        }
-    } catch {}
-}
-
-function markBackendUnhealthy(host) {
-    updateBackendHealth(host, false, 0);
-}
-
-// ----- بهبود دوم: Atomic DB Buffer & Batching -----
-async function bufferedWrite(env, query, params) {
-    if (!env || !env.DB) return;
-    DB_BUFFER.push({ query, params, ts: Date.now() });
-    if (DB_BUFFER.length >= BUFFER_THRESHOLD) {
-        return await flushDBBuffer(env);
-    }
-    return Promise.resolve();
-}
-
-async function flushDBBuffer(env) {
-    if (!DB_BUFFER.length) return;
-    if (!env || !env.DB) {
-        DB_BUFFER.length = 0;
-        return;
-    }
-    // کپی اتمی و پاکسازی
-    const batch = DB_BUFFER.splice(0, DB_BUFFER.length);
-    try {
-        const statements = batch.map(b => env.DB.prepare(b.query).bind(...b.params));
-        // D1 batch محدودیت 100 دارد، ما 50 تایی می‌فرستیم
-        await env.DB.batch(statements);
-    } catch (e) {
-        console.error("DB batch flush error:", e.message);
-        // در صورت خطا لاگ می‌کنیم و ادامه می‌دهیم، داده‌ها از دست می‌رود اما از کرش جلوگیری می‌شود
-    }
-}
-
-async function queueTrafficUpdate(env, username, deltaGb, deltaReq) {
-    if (!username || (deltaGb <=0 && deltaReq <=0)) return;
-    // استفاده از bufferedWrite برای کاهش فشار D1
-    try {
-        await bufferedWrite(env, "UPDATE users SET used_gb = used_gb + ?, used_req = used_req + ? WHERE username = ?", [deltaGb, deltaReq, username]);
-    } catch (e) {
-        console.error("queueTrafficUpdate error", e.message);
-    }
-}
-
-// ----- بهبود چهارم: Rate Limiting صنعتی -----
-function checkSlidingWindow(username, limit = SLIDING_WINDOW_LIMIT, windowMs = SLIDING_WINDOW_MS) {
-    const now = Date.now();
-    let arr = USER_SLIDING_WINDOW.get(username);
-    if (!arr) {
-        arr = [];
-        USER_SLIDING_WINDOW.set(username, arr);
-    }
-    // حذف قدیمی‌ها
-    const cutoff = now - windowMs;
-    while (arr.length && arr[0] < cutoff) arr.shift();
-    if (arr.length >= limit) return false; // محدود شده
-    arr.push(now);
-    return true;
-}
-
-function consumeLeakyBucket(username, capacity = LEAKY_BUCKET_CAPACITY, refillPerSec = LEAKY_BUCKET_REFILL_PER_SEC) {
-    const now = Date.now();
-    let bucket = USER_LEAKY_BUCKET.get(username);
-    if (!bucket) {
-        bucket = { tokens: capacity, lastLeak: now };
-        USER_LEAKY_BUCKET.set(username, bucket);
-        bucket.tokens--; // مصرف یکی
-        return true;
-    }
-    // محاسبه نشت
-    const elapsedSec = (now - bucket.lastLeak) / 1000;
-    const refill = elapsedSec * refillPerSec;
-    bucket.tokens = Math.min(capacity, bucket.tokens + refill);
-    bucket.lastLeak = now;
-    if (bucket.tokens < 1) return false; // سطل خالی
-    bucket.tokens--;
-    return true;
-}
-
-function isRateLimitedIndustrial(username) {
-    // ترکیب هر دو: اگر یکی محدود کرد، بلاک
-    if (!checkSlidingWindow(username)) return true;
-    if (!consumeLeakyBucket(username)) return true;
-    return false;
-}
-
-async function fetchWithNoise(url, init = {}, maxRetries = 2) {
-    try {
-        const hdrs = new Headers(init.headers || {});
-        if (typeof globalBypasser !== 'undefined') {
-            const rnd = globalBypasser.generateRandomHeaders();
-            for (const [k,v] of Object.entries(rnd)) {
-                const lk = k.toLowerCase();
-                if (['host','content-length','upgrade','connection'].includes(lk)) continue;
-                if (!hdrs.has(k)) hdrs.set(k, v);
-            }
-        }
-        const finalInit = { ...init, headers: hdrs, cf: { cacheTtl: 0, ...(init.cf||{}) } };
-        if (typeof globalBypasser !== 'undefined' && maxRetries > 1) {
-            return await globalBypasser.smartFetch(url, finalInit, maxRetries);
-        } else {
-            return await fetch(url, finalInit);
-        }
-    } catch (e) {
-        throw e;
-    }
-}
-
-// ----- بهبود پنجم: لیست IP پویا -----
-async function fetchIpList(env = null) {
-    const now = Date.now();
-    if (cachedIpList && (now - ipCacheTime < IP_CACHE_TTL)) {
-        return cachedIpList;
-    }
-    // اگر env شامل CONFIG_URL باشد از آن استفاده کن
-    let configUrl = IP_CONFIG_URL;
-    try {
-        if (env && env.IP_CONFIG_URL) configUrl = env.IP_CONFIG_URL;
-    } catch {}
-    try {
-        const res = await fetchWithNoise(configUrl, { method: 'GET' }, 2);
-        if (!res.ok) throw new Error('HTTP '+res.status);
-        const data = await res.json();
-        let list = [];
-        if (Array.isArray(data)) {
-            list = data;
-        } else if (data.ips && Array.isArray(data.ips)) {
-            list = data.ips;
-        } else if (data.data && Array.isArray(data.data)) {
-            list = data.data;
-        }
-        // فیلتر ورودی‌های معتبر: باید شامل : و # یا حداقل IP:port باشن
-        const valid = list.filter(x => typeof x === 'string' && x.includes(':'));
-        if (valid.length) {
-            cachedIpList = valid;
-            ipCacheTime = now;
-            return valid;
-        }
-    } catch (e) {
-        console.error('fetchIpList failed', e.message);
-    }
-    // fallback به cache قبلی یا null
-    return cachedIpList || null;
-}
-
-
-
 export default {
     
     async fetch(request, env, ctx) {
-        try {
-            // memory guard
-            pruneCachesIfNeeded();
-            trackRequest(env, ctx);
-            const url = new URL(request.url);
-            // Stealth: accept any path containing uuid-like pattern as railway tunnel attempt
-            // This helps hide fixed path /Ma_Ke_Vaslim from fingerprinting
-            const isStealthRailway = url.pathname.includes('/railway-io/') || url.pathname === '/Ma_Ke_Vaslim' || url.searchParams.has('ed') || url.searchParams.get('type') === 'xhttp' || url.searchParams.get('type') === 'httpupgrade';
-
+        trackRequest(env, ctx);
+        const url = new URL(request.url); // <--- فقط همین یک بار تعریف می‌شود
 
         // این بلاک را بعد از تعریف متغیر url اضافه کنید:
 if (url.pathname === "/api/init-db") {
@@ -749,39 +306,17 @@ if (url.pathname === "/api/init-db") {
         return new Response(`Database init failed: ${err.message}`, { status: 500 });
     }
 }
-        if (url.pathname.startsWith("/railway-io/")) {
-            const extractedUuid = url.pathname.split("/")[2];
-            const transportParam = url.searchParams.get('type') || url.searchParams.get('transport') || (hasUpgradeRequest(request, true) ? 'ws' : (hasUpgradeRequest(request, false) ? 'httpupgrade' : 'xhttp'));
-            if (extractedUuid) {
-                if (!isValidUUIDFormat(extractedUuid)) {
-                    // ممکن است path شامل extra باشه، تلاش برای استخراج UUID از وسط path
-                    const maybeUuid = extractedUuid.split('?')[0].split('&')[0];
-                    if (!isValidUUIDFormat(maybeUuid)) {
-                        // fallback: try from query ?ed or full path
-                        // ولی ما ادامه میدیم
-                    }
-                }
-                return await handleRailwayWS(request, env, ctx, extractedUuid, transportParam);
-            }
-        }
         if (Router.isWebSocketUpgrade(request) && url.pathname.startsWith("/railway-io/")) {
             const extractedUuid = url.pathname.split("/")[2];
             if (extractedUuid) {
-                return await handleRailwayWS(request, env, ctx, extractedUuid, 'ws');
+                // ✅ اصلاح شد: ctx به عنوان ورودی سوم اضافه شد
+                return await handleRailwayWS(request, env, ctx, extractedUuid);
             }
         }
         
-        // ✅ پشتیبانی از ws, xhttp, httpupgrade روی مسیر اصلی
-        if (url.pathname === "/Ma_Ke_Vaslim") {
-            // تشخیص ترانسپورت
-            const t = url.searchParams.get('type') || url.searchParams.get('transport') || (hasUpgradeRequest(request, true) ? 'ws' : (hasUpgradeRequest(request, false) ? 'httpupgrade' : 'xhttp'));
-            if (SUPPORTED_TRANSPORTS.includes(t) || hasUpgradeRequest(request, false) || request.method === 'POST') {
-                return await Router.handleWebSocket(request, env, ctx, t);
-            }
-        }
-        // حالت استاندارد قبلی (سازگاری)
+        // ✅ حالت استاندارد و بدون ارور
         if (Router.isWebSocketUpgrade(request) && url.pathname === "/Ma_Ke_Vaslim") {
-            return await Router.handleWebSocket(request, env, ctx, 'ws');
+            return await Router.handleWebSocket(request, env, ctx);
         }
 
         if (Router.isSubscriptionPath(url.pathname)) {
@@ -799,18 +334,6 @@ if (url.pathname === "/api/init-db") {
         return new Response(HTML_TEMPLATES.nginx, {
             headers: { "Content-Type": "text/html; charset=utf-8" },
         });
-        } catch (err) {
-            console.error("Global fetch error 1101 guard:", err && err.message ? err.message : err);
-            try {
-                // Fallback to nginx page to avoid 1101 rendering
-                return new Response(HTML_TEMPLATES.nginx, {
-                    headers: { "Content-Type": "text/html; charset=utf-8" },
-                    status: 200
-                });
-            } catch {
-                return new Response("OK", { status: 200 });
-            }
-        }
     },
     async scheduled(_event, env, ctx) {
         ctx.waitUntil(
@@ -834,33 +357,24 @@ if (url.pathname === "/api/init-db") {
 }; // پایان بلاک export default
 const Router = {
     isWebSocketUpgrade(request) {
-        // Support both ws and httpupgrade: any Connection: upgrade counts
-        // Strict check for ws still allowed, but also accept httpupgrade generic
-        return hasUpgradeRequest(request, false);
-    },
-    isStrictWebSocket(request) {
-        return hasUpgradeRequest(request, true);
+        const upgradeHeader = (request.headers.get("Upgrade") || "").toLowerCase();
+        return upgradeHeader === "websocket";
     },
     isSubscriptionPath(pathname) {
         return pathname.startsWith("/sub/") || pathname.startsWith("/feed/");
     },
-    async handleWebSocket(_request, env, ctx, transport = 'ws') {
+    async handleWebSocket(_request, env, ctx) {
         try {
             let proxyIP = "proxyip.cmliussss.net";
             try {
-                if (env.DB) {
-                    const proxyRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'proxy_ip'").first();
-                    if (proxyRow && proxyRow.value) {
-                        proxyIP = proxyRow.value;
-                    }
+                const proxyRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'proxy_ip'").first();
+                if (proxyRow && proxyRow.value) {
+                    proxyIP = proxyRow.value;
                 }
             } catch (e) {}
             const mockStoredData = { proxy_ip: proxyIP };
-            // early data parsing for xhttp
-            const early = parseEarlyData(_request);
-            return handleVLESS(env, mockStoredData, ctx, transport, early);
+            return handleVLESS(env, mockStoredData, ctx);
         } catch (e) {
-            console.error("handleWebSocket error", e.message);
             return new Response("Internal Server Error", { status: 500 });
         }
     },
@@ -869,52 +383,12 @@ const Router = {
         const offset = isSubPath ? 5 : 6;
         let subUser = decodeURIComponent(url.pathname.slice(offset));
         const host = url.hostname;
-        // Edge cache check
-        try {
-            const cache = caches.default;
-            const cacheKey = new Request(url.toString(), { method: 'GET' });
-            let cached = await cache.match(cacheKey);
-            if (cached) {
-                // clone with fresh headers
-                const hdrs = new Headers(cached.headers);
-                hdrs.set('X-Cache', 'HIT');
-                return new Response(cached.body, { status: cached.status, headers: hdrs });
-            }
-        } catch {}
         try {
             const user = await env.DB.prepare("SELECT * FROM users WHERE username = ? OR uuid = ?").bind(subUser, subUser).first();
             if (!user || user.connection_type !== atob("dmxlc3M=")) {
                 return new Response("Not Found", { status: 404 });
             }
-            // 📦 دریافت کانفیگ IP اختصاصی (پروکسی + نوع ترانسپورت)
-            let ipConfig = {};
-            try {
-                if (cachedIpConfig && (Date.now() - ipConfigCacheTime < IP_CONFIG_CACHE_TTL)) {
-                    ipConfig = cachedIpConfig;
-                } else {
-                    const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'ip_config'").first();
-                    if (row && row.value) {
-                        ipConfig = JSON.parse(row.value);
-                        cachedIpConfig = ipConfig;
-                        ipConfigCacheTime = Date.now();
-                    }
-                }
-            } catch {}
-            const resp = await SubscriptionService.generateText(user, host, ipConfig);
-            // Put in edge cache
-            try {
-                const cache = caches.default;
-                const cacheKey = new Request(url.toString(), { method: 'GET' });
-                const respClone = resp.clone();
-                const hdrs = new Headers(respClone.headers);
-                hdrs.set('Cache-Control', 'public, max-age=' + SUB_CACHE_TTL);
-                const toCache = new Response(respClone.body, { status: respClone.status, headers: hdrs });
-                ctxWait: {
-                    // use waitUntil if available via global? We'll just put without waitUntil
-                    await cache.put(cacheKey, toCache);
-                }
-            } catch {}
-            return resp;
+            return await SubscriptionService.generateText(user, host);
         } catch (err) {
             return new Response("Error building config: " + err.message, { status: 500 });
         }
@@ -985,13 +459,9 @@ const Router = {
                 headers: { "Content-Type": "text/html; charset=utf-8" },
             });
         } else {
-            // ========== خروجی برای نرم‌افزار (ساب‌اسکریپشن) با IP config ==========
-            let ipConfig2 = {};
-            try {
-                const row2 = await env.DB.prepare("SELECT value FROM settings WHERE key = 'ip_config'").first();
-                if (row2 && row2.value) ipConfig2 = JSON.parse(row2.value);
-            } catch {}
-            return await SubscriptionService.generateText(user, url.hostname, ipConfig2);
+            // ========== خروجی برای نرم‌افزار (ساب‌اسکریپشن) ==========
+            // استفاده از تابع موجود برای تولید کانفیگ‌ها
+            return await SubscriptionService.generateText(user, url.hostname);
         }
     } catch (err) {
         return new Response("Error: " + err.message, { status: 500 });
@@ -1332,40 +802,6 @@ USERS_LIST_CACHE.lastFetch = 0;
                 }
             }
         }
-        
-        if (url.pathname === "/api/ip-config") {
-            if (request.method === "GET") {
-                try {
-                    const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'ip_config'").first();
-                    let data = {};
-                    if (row && row.value) {
-                        try { data = JSON.parse(row.value); } catch {}
-                    }
-                    return new Response(JSON.stringify(data), {
-                        headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" }
-                    });
-                } catch (e) {
-                    return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: { "Content-Type": "application/json" } });
-                }
-            }
-            if (request.method === "POST") {
-                try {
-                    const body = await request.json();
-                    // body is expected to be object: { "ip:port": {enabled, ws, xhttp, hu, proxy, remark} }
-                    await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('ip_config', ?)").bind(JSON.stringify(body)).run();
-                    // invalidate cache
-                    cachedIpConfig = null;
-                    ipConfigCacheTime = 0;
-                    return new Response(JSON.stringify({ success: true }), {
-                        headers: { "Content-Type": "application/json; charset=utf-8" }
-                    });
-                } catch (e) {
-                    return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: { "Content-Type": "application/json" } });
-                }
-            }
-            return new Response(JSON.stringify({ error: "Method not allowed" }), { status: 405, headers: { "Content-Type": "application/json" } });
-        }
-
         return new Response(JSON.stringify({ error: "Not Found" }), { status: 404, headers: { "Content-Type": "application/json" } });
     },
 };
@@ -1451,22 +887,11 @@ const DbService = {
     },
 };
 const SubscriptionService = {
-    async generateText(user, host, ipConfig = {}) {
+    async generateText(user, host) {
         // ۱. دامین فیلتر شده (اگر واقعاً می‌خواهید SNI متفاوت باشد، در بخش params در پایین از آن استفاده کنید)
-        const mySecretDomain = ""; 
+        const mySecretDomain = "mkvasl.mkvsl.workers.dev"; 
 
-                // 📡 بهبود پنجم: دریافت پویا از راه دور با fallback به لیست سخت‌کد شده
-        let rawIpList = null;
-        try {
-            // سعی کن لیست پویا بگیری
-            const dynamicList = await fetchIpList(null);
-            if (dynamicList && dynamicList.length) {
-                rawIpList = dynamicList;
-            }
-        } catch {}
-        if (!rawIpList) {
-            // fallback لیست پیش‌فرض (همان لیست قدیمی)
-            rawIpList = [
+        const rawIpList = [
             "add555.musicalls.ir:443#A🇹🇷",
             "ip3.synthara.ir:443#B🇹🇷",
             "cf-mtn.coixconqwe1.ir:443#C🇫🇮",
@@ -1505,8 +930,7 @@ const SubscriptionService = {
             "178.250.187.110:443#ایرانسل💛🛰️",
             "104.16.1.1:443#ایرانسل💛🔥",
             "cf-mci.coixconqwe1.ir:443#Gaming🎮"
-            ];
-        }
+        ];
 
         // محاسبات حجم و زمان باقی‌مانده
         let remVol = "∞";
@@ -1528,60 +952,27 @@ const SubscriptionService = {
         const links = [];
 
         // انتقال تابع به بیرون از حلقه برای پرفورمنس بالاتر
-        function generateRailwayConfig(userUuid, workerHost, cleanIp, port, configName, fingerprint, fragStr, extraStr, transport = 'ws', mode = 'auto') {
+        function generateRailwayConfig(userUuid, workerHost, cleanIp, port, configName, fingerprint, fragStr, extraStr) {
             const encodedName = encodeURIComponent(configName);
-            const masterUuid = "e5b8a6a1-a7b3-4f16-89d2-97b7914db459";
+            const masterUuid = "e5b8a6a1-a7b3-4f16-89d2-97b7914db459"; // حتماً این مقدار را به ENV منتقل کنید!
             
-            // Base params
             const params = new URLSearchParams({
                 encryption: "none",
                 security: "tls",
-                sni: mySecretDomain,
+                sni: mySecretDomain, // در صورت نیاز می‌توانید workerHost را با mySecretDomain جایگزین کنید
                 host: mySecretDomain, 
-                fp: fingerprint,
-                type: transport, 
+                fp: fingerprint, // اعمال Fingerprint واقعی
+                type: "ws", 
+                path: `/railway-io/${userUuid}` ,
                 alpn: "h2,http/1.1"
             });
-
-            if (transport === 'xhttp') {
-                params.set('path', `/railway-io/${userUuid}?ed=2048`);
-                params.set('mode', mode);
-            } else if (transport === 'httpupgrade') {
-                params.set('path', `/railway-io/${userUuid}`);
-            } else {
-                params.set('path', `/railway-io/${userUuid}`);
-            }
             
+            // تزریق متغیرهای هوشمند به انتهای لینک کانفیگ
             return `vless://${masterUuid}@${cleanIp}:${port}?${params.toString()}${fragStr}&extraParams=${extraStr}#${encodedName}`;
         }
 
-        function generateRailwayConfigMulti(userUuid, workerHost, cleanIp, port, baseName, fingerprint, fragStr, extraStr) {
-            // Generate 3 variants per IP: ws, xhttp, httpupgrade
-            const variants = [];
-            const info = baseName.includes('--->') ? baseName : baseName;
-            // ws
-            variants.push(generateRailwayConfig(userUuid, workerHost, cleanIp, port, `${baseName} [WS]`, fingerprint, fragStr, extraStr, 'ws', 'auto'));
-            // xhttp
-            variants.push(generateRailwayConfig(userUuid, workerHost, cleanIp, port, `${baseName} [XHTTP]`, fingerprint, fragStr, extraStr, 'xhttp', 'auto'));
-            // httpupgrade
-            variants.push(generateRailwayConfig(userUuid, workerHost, cleanIp, port, `${baseName} [HU]`, fingerprint, fragStr, extraStr, 'httpupgrade', 'auto'));
-            return variants;
-        }
-
-        // حلقه اصلی ساخت کانفیگ‌ها با پشتیبانی از تنظیمات per-IP (نوع + پروکسی + فعال/غیرفعال)
+        // حلقه اصلی ساخت کانفیگ‌ها
         rawIpList.forEach((item) => {
-            // پارس اولیه برای یافتن ip:port
-            const [addrPartRaw, customNameRaw] = item.split('#');
-            const ipPortKey = addrPartRaw ? addrPartRaw.split(':').slice(0,2).join(':') : null;
-            // دریافت کانفیگ اختصاصی برای این IP
-            let perIpConf = null;
-            if (ipPortKey && ipConfig) {
-                // کلید می‌تونه دقیق ip:port باشه یا با remark
-                perIpConf = ipConfig[ipPortKey] || ipConfig[item] || ipConfig[addrPartRaw] || null;
-            }
-            // اگر کانفیگ وجود داره و غیرفعاله، skip
-            if (perIpConf && perIpConf.enabled === false) return;
-
             const [addressPart, customName] = item.split('#');
             const [ipOrDomain, port] = addressPart.split(':');
 
@@ -1613,51 +1004,11 @@ const SubscriptionService = {
                     extraParamsObj.xmux.maxConcurrency = "1-4";
                 }
 
-                // 📡 اعمال پروکسی اگر برای این IP ثبت شده
-                let effectiveExtraParamsObj = { ...extraParamsObj };
-                let effectiveRemark = remark;
-                if (perIpConf && perIpConf.proxy && perIpConf.proxy.trim()) {
-                    const proxyStr = perIpConf.proxy.trim();
-                    // اضافه کردن به extraParams برای پشتیبانی Xray dialerProxy
-                    effectiveExtraParamsObj.dialerProxy = proxyStr;
-                    effectiveExtraParamsObj.proxy = proxyStr;
-                    // اضافه به remark برای نمایش
-                    effectiveRemark = `${remark} [Proxy]`;
-                }
-                // اگر remark اختصاصی در کانفیگ IP هست، استفاده کن
-                if (perIpConf && perIpConf.remark && perIpConf.remark.trim()) {
-                    effectiveRemark = `${perIpConf.remark} ${info}`;
-                }
+                const extraParams = encodeURIComponent(JSON.stringify(extraParamsObj));
 
-                const extraParams = encodeURIComponent(JSON.stringify(effectiveExtraParamsObj));
-
-                // تولید ترانسپورت‌ها بر اساس تنظیمات per-IP
-                let transportsToGenerate = [];
-                if (perIpConf) {
-                    if (perIpConf.ws) transportsToGenerate.push('ws');
-                    if (perIpConf.xhttp) transportsToGenerate.push('xhttp');
-                    if (perIpConf.hu) transportsToGenerate.push('httpupgrade');
-                    // اگر هیچکدوم تیک نخورده ولی enabled هست، همه رو بساز (backward compatible)
-                    if (transportsToGenerate.length === 0 && perIpConf.enabled !== false) {
-                        transportsToGenerate = ['ws','xhttp','httpupgrade'];
-                    }
-                } else {
-                    transportsToGenerate = ['ws','xhttp','httpupgrade'];
-                }
-
-                // تابع کمکی برای تولید فقط ترانسپورت‌های انتخاب شده
-                const generateSelected = (transports) => {
-                    const list = [];
-                    for (const tr of transports) {
-                        if (tr === 'ws') list.push(generateRailwayConfig(user.uuid, host, ipOrDomain, port, `${effectiveRemark} [WS]`, fp, currentFragment, extraParams, 'ws', 'auto'));
-                        else if (tr === 'xhttp') list.push(generateRailwayConfig(user.uuid, host, ipOrDomain, port, `${effectiveRemark} [XHTTP]`, fp, currentFragment, extraParams, 'xhttp', 'auto'));
-                        else if (tr === 'httpupgrade') list.push(generateRailwayConfig(user.uuid, host, ipOrDomain, port, `${effectiveRemark} [HU]`, fp, currentFragment, extraParams, 'httpupgrade', 'auto'));
-                    }
-                    return list;
-                };
-
-                const multiLinks = generateSelected(transportsToGenerate);
-                for (const l of multiLinks) links.push(l);
+                // پاس دادن تمام متغیرها به تابع سازنده
+                const linkRailway = generateRailwayConfig(user.uuid, host, ipOrDomain, port, remark, fp, currentFragment, extraParams);
+                links.push(linkRailway);
             }
         });
 
@@ -1696,7 +1047,7 @@ async function flushExpiredTraffic(env) {
         }
     }
 }
-async function handleVLESS(env, storedData = null, ctx = null, transport = 'ws') {
+async function handleVLESS(env, storedData = null, ctx = null) {
     const socketPair = new WebSocketPair();
     const [clientSock, serverSock] = Object.values(socketPair);
     serverSock.accept();
@@ -1720,9 +1071,8 @@ async function handleVLESS(env, storedData = null, ctx = null, transport = 'ws')
         if (GLOBAL_WRITE_LOCK.get(username)) return;
         let lastDbWrite = GLOBAL_LAST_DB_WRITE.get(username) || 0;
         let now = Date.now();
-        let thresholdBytes = TRAFFIC_FLUSH_THRESHOLD_MB * 1024 * 1024;
-        // 🧠 بهبود دوم: افزایش آستانه + استفاده از بافر اتمی
-        if (current >= thresholdBytes || (current > 0 && now - lastDbWrite > TRAFFIC_FLUSH_INTERVAL_MS)) {
+        let thresholdBytes = 10 * 1024 * 1024;
+        if (current >= thresholdBytes || (current > 0 && now - lastDbWrite > 60000)) {
             GLOBAL_WRITE_LOCK.set(username, true);
             let toCommit = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
             let toCommitReq = USER_REQ_CACHE.get(username) || 0;
@@ -1734,14 +1084,9 @@ async function handleVLESS(env, storedData = null, ctx = null, transport = 'ws')
             USER_REQ_CACHE.set(username, 0);
             GLOBAL_LAST_DB_WRITE.set(username, now);
             let deltaGb = toCommit / (1024 * 1024 * 1024);
-            // بهبود دوم: به جای run مستقیم از bufferedWrite
             let writeTask = async () => {
                 try {
-                    await queueTrafficUpdate(env, username, deltaGb, toCommitReq);
-                    // فلش بافر اگر پر شده
-                    if (DB_BUFFER.length >= BUFFER_THRESHOLD) {
-                        await flushDBBuffer(env);
-                    }
+                    await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, used_req = used_req + ? WHERE username = ?").bind(deltaGb, toCommitReq, username).run();
                 } catch (e) {
                     console.error(e.message);
                 } finally {
@@ -1975,19 +1320,17 @@ async function handleVLESS(env, storedData = null, ctx = null, transport = 'ws')
                     addr = `${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}`;
                 } else if (addrType === 2) {
                     const domainLen = chunkBuffer[offset++];
-                    addr = GLOBAL_DECODER.decode(chunkBuffer.subarray(offset, offset + domainLen));
+                    addr = GLOBAL_DECODER.decode(chunkBuffer.slice(offset, offset + domainLen));
                     offset += domainLen;
                 } else if (addrType === 3) {
                     offset += 16;
                     addr = "ipv6-unsupported";
                 }
-                const rawData = chunkBuffer.subarray(offset);
+                const rawData = chunkBuffer.slice(offset);
                 const respHeader = new Uint8Array([chunkBuffer[0], 0]);
                 if (cmd === 2) {
-                    // ⚡ بهبود سوم: مسیر سریع UDP - بدون احراز هویت اضافی برای DNS
                     if (port === 53) {
                         isDnsQuery = true;
-                        // سریع‌ترین پاسخ: مستقیم DoH بدون دخالت بک‌اند
                         await forwardVlessUDP(rawData, serverSock, respHeader, addBytes);
                     } else {
                         serverSock.close();
@@ -2738,7 +2081,7 @@ function extractUUIDFromVless(data) {
     }
     return uuid;
 }
-async function handleRailwayWS(request, env, ctx, userUuid, forcedTransport = null) {
+async function handleRailwayWS(request, env, ctx, userUuid) {
     // ۱. فراخوانی کامل اطلاعات کاربر شامل محدودیت‌های ریکوئست
     const user = await env.DB.prepare("SELECT username, is_active, limit_gb, used_gb, limit_req, used_req FROM users WHERE uuid = ?").bind(userUuid).first();
     if (!user || user.is_active === 0) {
@@ -2775,7 +2118,7 @@ async function handleRailwayWS(request, env, ctx, userUuid, forcedTransport = nu
         
         let lastDbWrite = GLOBAL_LAST_DB_WRITE.get(username) || 0;
         let now = Date.now();
-        let thresholdBytes = TRAFFIC_FLUSH_THRESHOLD_MB * 1024 * 1024; // آپدیت دیتابیس به ازای هر ۱۰ مگابایت
+        let thresholdBytes = 10 * 1024 * 1024; // آپدیت دیتابیس به ازای هر ۱۰ مگابایت
         
         if (current >= thresholdBytes || (current > 0 && now - lastDbWrite > 60000)) {
             GLOBAL_WRITE_LOCK.set(username, true);
@@ -2793,73 +2136,11 @@ async function handleRailwayWS(request, env, ctx, userUuid, forcedTransport = nu
             
             let deltaGb = toCommit / (1024 * 1024 * 1024);
             
-            // بهبود دوم: استفاده از بافر
-            queueTrafficUpdate(env, username, deltaGb, toCommitReq)
-                .then(() => {
-                    if (DB_BUFFER.length >= BUFFER_THRESHOLD) return flushDBBuffer(env);
-                })
+            env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, used_req = used_req + ? WHERE username = ?")
+                .bind(deltaGb, toCommitReq, username)
+                .run()
                 .catch(e => console.error(e))
                 .finally(() => GLOBAL_WRITE_LOCK.set(username, false));
-        }
-    }
-
-    // ۶. تشخیص ترانسپورت: ws / xhttp / httpupgrade
-    let transport = forcedTransport || 'ws';
-    let earlyDataForXHTTP = null;
-    try {
-        const t1 = new URL(request.url).searchParams.get('type');
-        const t2 = new URL(request.url).searchParams.get('transport');
-        const t3 = request.headers.get('x-transport-type');
-        if (t1 && SUPPORTED_TRANSPORTS.includes(t1)) transport = t1;
-        else if (t2 && SUPPORTED_TRANSPORTS.includes(t2)) transport = t2;
-        else if (t3 && SUPPORTED_TRANSPORTS.includes(t3)) transport = t3;
-        else if (request.method === 'POST') transport = 'xhttp'; // packet-up
-        // 🚀 XHTTP: استخراج early data از هدر
-        const earlyParse = parseEarlyData(request);
-        if (earlyParse.earlyData) earlyDataForXHTTP = earlyParse.earlyData;
-    } catch {}
-
-    // 🧠 بهبود چهارم: چک Rate Limit قبل از هر چیز
-    if (isRateLimitedIndustrial(username)) {
-        return new Response("Too Many Requests - Leaky Bucket", { status: 429, headers: { "Retry-After": "5", "Content-Type": "text/plain" } });
-    }
-
-    // ۶.۱ XHTTP POST (packet-up) handling - بدون Upgrade
-    if (transport === 'xhttp' && request.method === 'POST' && !hasUpgradeRequest(request, false)) {
-        try {
-            // Forward streaming body to backend
-            const backendHost = selectBackendRoundRobin(0);
-            if (!backendHost) return new Response("No backend", { status: 502 });
-            const backendUrl = new URL(request.url);
-            backendUrl.hostname = backendHost;
-            backendUrl.protocol = 'https:';
-            backendUrl.port = '443';
-            backendUrl.pathname = '/Ma_Ke_Vaslim';
-            const fwdHeaders = new Headers(request.headers);
-            fwdHeaders.set('Host', backendHost);
-            // add bypass headers
-            if (typeof globalBypasser !== 'undefined') {
-                const rnd = globalBypasser.generateRandomHeaders();
-                for (const [k,v] of Object.entries(rnd)) {
-                    const lk = k.toLowerCase();
-                    if (['host','content-length'].includes(lk)) continue;
-                    if (!fwdHeaders.has(k)) fwdHeaders.set(k,v);
-                }
-            }
-            const backendRes = await fetch(backendUrl.toString(), {
-                method: 'POST',
-                headers: fwdHeaders,
-                body: request.body,
-                duplex: 'half',
-                cf: { cacheTtl: 0 }
-            });
-            return new Response(backendRes.body, {
-                status: backendRes.status,
-                headers: backendRes.headers
-            });
-        } catch (e) {
-            console.error("xhttp POST passthrough failed", e.message);
-            return new Response("XHTTP backend error", { status: 502 });
         }
     }
 
@@ -2870,13 +2151,9 @@ async function handleRailwayWS(request, env, ctx, userUuid, forcedTransport = nu
     const recentRate = typeof globalBypasser !== 'undefined' ? globalBypasser.getRecentRequestRate() : 0;
     const jitterBase = Math.max(50, Math.min(500, 10000 / (recentRate + 1)));
 
-    // 🚀 بهبود اول: استفاده از Load Balancer وزنی
-    const healthyBackends = getAllHealthyBackendsSorted();
-    const backendAttempts = healthyBackends.map((backend, idx) => {
+    const backendAttempts = RAILWAY_BACKENDS.map((backend, idx) => {
         const jitter = jitterBase + Math.floor(Math.random() * jitterBase);
-        const state = BACKEND_STATE.get(backend);
-        const weightDelay = state ? (5 - (state.weight || 1)) * 20 : 0; // وزن کمتر = تاخیر بیشتر
-        return { backend, delay: idx * jitter + weightDelay, idx, state };
+        return { backend, delay: idx * jitter, idx };
     });
 
     for (const { backend, delay, idx } of backendAttempts) {
@@ -2907,40 +2184,24 @@ async function handleRailwayWS(request, env, ctx, userUuid, forcedTransport = nu
                 attemptHeaders.set("Host", backend);
             }
 
-            const startTime = Date.now();
-            const res = await fetchWithNoise(railwayUrl.toString(), {
+            const res = await fetch(railwayUrl.toString(), {
                 method: "GET",
                 headers: attemptHeaders,
                 redirect: "manual",
                 cf: { cacheTtl: 0, cacheEverything: false }
-            }, 1);
-            const rtt = Date.now() - startTime;
+            });
 
             if (res.webSocket) {
-                updateBackendHealth(backend, true, rtt);
                 railwayResponse = res;
-                // 🚀 XHTTP Enhancement: اگر early data داریم، به بک‌اند فوروارد کن
-                try {
-                    if (typeof earlyDataForXHTTP !== 'undefined' && earlyDataForXHTTP && earlyDataForXHTTP.byteLength) {
-                        const bws = res.webSocket;
-                        // بک‌اند هنوز accept نشده، بعداً accept میشه و early data فرستاده میشه در bridge
-                        // برای اطمینان، early data رو در یک پراپرتی موقت نگه می‌داریم
-                        railwayResponse._earlyData = earlyDataForXHTTP;
-                    }
-                } catch {}
                 break;
             } else if (res.status === 429 || res.status === 503) {
-                updateBackendHealth(backend, false, rtt);
+                // Rate limited - exponential backoff با جیتر
                 const backoff = Math.min(1000 * Math.pow(2, idx) + Math.random() * 1000, 5000);
                 await new Promise(r => setTimeout(r, backoff));
                 continue;
-            } else {
-                // برای سایر کدها هم به عنوان نیمه-موفق در نظر بگیر ولی وزن کم کن
-                if (res.status >= 400) updateBackendHealth(backend, false, rtt);
             }
         } catch (err) {
             console.log(`Backend ${backend} failed at attempt ${idx}, trying next... ${err.message}`);
-            markBackendUnhealthy(backend);
             const backoff = Math.min(500 * Math.pow(1.5, idx) + Math.random() * 500, 3000);
             await new Promise(r => setTimeout(r, backoff));
             continue;
@@ -2957,21 +2218,10 @@ async function handleRailwayWS(request, env, ctx, userUuid, forcedTransport = nu
     // ۹. استارت تونل
     // ۹. استارت تونل با استفاده از Streams API
     const backendSocket = railwayResponse.webSocket;
-    // اگر early data از مرحله قبل داریم، بعد از accept بفرست
-    const pendingEarlyData = railwayResponse._earlyData || earlyDataForXHTTP || null;
     const { 0: clientSocket, 1: localServerSocket } = new WebSocketPair();
     
     backendSocket.accept();
     localServerSocket.accept();
-    // 🚀 XHTTP: ارسال early data بلافاصله بعد از اتصال
-    if (pendingEarlyData && pendingEarlyData.byteLength) {
-        try {
-            // تلاش برای ارسال به صورت باینری
-            backendSocket.send(pendingEarlyData);
-        } catch (e) {
-            console.error("Failed to send early data", e.message);
-        }
-    }
 
     // --- شروع پیاده‌سازی تونل لوله‌ای (Piping) ---
 
@@ -3038,7 +2288,8 @@ async function handleRailwayWS(request, env, ctx, userUuid, forcedTransport = nu
         ac = Math.max(0, ac - 1);
         ACTIVE_CONNECTIONS_COUNT.set(username, ac);
         
-        // 🌟 تغییر کلیدی + بهبود دوم: فقط اگر ac=0، دیتابیس را با بافر آپدیت کن
+        // 🌟 تغییر کلیدی: فقط اگر ac برابر ۰ باشد، یعنی هیچ اتصال فعالی نداریم
+        // و حالا می‌توانیم با خیال راحت دیتابیس را آپدیت و کش را پاک کنیم.
         if (ac === 0) {
             let remainingBytes = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
             let remainingReqs = USER_REQ_CACHE.get(username) || 0;
@@ -3047,33 +2298,25 @@ async function handleRailwayWS(request, env, ctx, userUuid, forcedTransport = nu
                 GLOBAL_WRITE_LOCK.set(username, true);
                 let deltaGb = remainingBytes / (1024 * 1024 * 1024);
                 
-                const dbTask = (async () => {
-                    try {
-                        await queueTrafficUpdate(env, username, deltaGb, remainingReqs);
-                        await flushDBBuffer(env);
-                    } catch (e) {
-                        console.error("DB Save Error:", e);
-                    } finally {
+                const dbTask = env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, used_req = used_req + ? WHERE username = ?")
+                    .bind(deltaGb, remainingReqs, username)
+                    .run()
+                    .catch(e => console.error("DB Save Error:", e))
+                    .finally(() => {
+                        // پاک‌سازی کش‌ها فقط در صورتی که همه اتصالات قطع شده باشند
                         GLOBAL_WRITE_LOCK.delete(username);
                         GLOBAL_TRAFFIC_CACHE.delete(username);
                         USER_REQ_CACHE.delete(username);
-                    }
-                })();
+                    });
                 
                 if (ctx) ctx.waitUntil(dbTask);
                 else dbTask;
             } else {
+                // اگر حجمی برای ثبت نبود ولی ac صفر شد، کش‌ها را پاک کن تا حافظه آزاد شود
                 GLOBAL_TRAFFIC_CACHE.delete(username);
                 USER_REQ_CACHE.delete(username);
             }
         }
-        // فلش بافر باقی‌مانده در هر صورت
-        try {
-            if (DB_BUFFER.length > 0) {
-                const flushTask = flushDBBuffer(env);
-                if (ctx) ctx.waitUntil(flushTask);
-            }
-        } catch {}
     };
 
     localServerSocket.addEventListener("close", closeSockets);
@@ -3618,9 +2861,6 @@ const HTML_TEMPLATES = {
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 11l3-3m0 0l3 3m-3-3v8m0-13a9 9 0 110 18 9 9 0 010-18z"></path></svg>
                     <span id="update-badge" class="absolute top-0 right-0 w-2.5 h-2.5 bg-red-500 border-2 border-emerald-50 dark:border-emerald-900 rounded-full hidden animate-pulse"></span>
                 </button>				
-                <button onclick="toggleIpManagerModal(true)" class="p-2 rounded-lg bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-800/50 hover:bg-blue-100 dark:hover:bg-blue-900/50 transition text-blue-600 dark:text-blue-400 shadow-sm" title="IP Manager - مدیریت IP و پروکسی و ترانسپورت">
-                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9v-9m0-9v9"></path></svg>
-                </button>
                 <button onclick="toggleSettingsModal(true)" class="p-2 rounded-lg bg-gray-100 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border hover:bg-gray-200 dark:hover:bg-zinc-800 transition text-gray-600 dark:text-gray-300 shadow-sm" title="Settings">
                     <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
                 </button>
@@ -4019,41 +3259,6 @@ const HTML_TEMPLATES = {
                     <button type="button" onclick="toggleSettingsModal(false)" class="flex-1 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 font-medium rounded-lg text-sm transition">انصراف</button>
                     <button type="button" onclick="saveSettings()" id="save-settings-btn" class="flex-1 py-2 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg text-sm transition">ذخیره تنظیمات</button>
                 </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- 🔥 IP Manager Modal - مدیریت پیشرفته IP، ترانسپورت و پروکسی -->
-    <div id="ip-manager-modal" class="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
-        <div class="w-full max-w-4xl bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl shadow-xl overflow-hidden transition-all transform duration-300 opacity-0 scale-95 ease-out flex flex-col max-h-[90vh]">
-            <div class="px-6 py-4 border-b border-gray-150 dark:border-amoled-border flex justify-between items-center bg-gradient-to-r from-blue-50 to-indigo-50 dark:from-blue-950/20 dark:to-indigo-950/20">
-                <div>
-                    <h3 class="font-bold text-gray-900 dark:text-zinc-100 flex items-center gap-2">
-                        🌍 مدیریت IP، ترانسپورت و پروکسی
-                        <span class="text-[10px] px-2 py-0.5 bg-blue-100 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 rounded-full">XHTTP Enhanced</span>
-                    </h3>
-                    <p class="text-[11px] text-gray-500 dark:text-zinc-400 mt-1">برای هر IP انتخاب کن چه نوع کانفیگی ساخته بشه و چه پروکسی استفاده کنه (اختیاری)</p>
-                </div>
-                <button onclick="toggleIpManagerModal(false)" class="text-gray-400 hover:text-gray-600 dark:hover:text-zinc-200">
-                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
-                </button>
-            </div>
-            <div class="p-4 bg-yellow-50 dark:bg-yellow-900/20 border-b border-yellow-200 dark:border-yellow-800/50 text-[11px] text-yellow-800 dark:text-yellow-300 leading-relaxed">
-                💡 <b>راهنما:</b> هر ردیف یک Clean IP هست. می‌تونی تیک WS/XHTTP/HU رو بزنی تا فقط همون نوع ساخته بشه. اگر همه رو خاموش کنی، اون IP کلاً از ساب حذف میشه. فیلد پروکسی اختیاریه - مثلاً <code class="px-1 bg-yellow-100 dark:bg-yellow-900/30 rounded">opslt994:e2efvx2kqzjv@188.245.58.129:48528</code> . این پروکسی داخل extraParams به کانفیگ اضافه میشه و کلاینت‌های پیشرفته می‌تونن از طریق اون به لوکیشن کشور خاص وصل بشن. XHTTP با <code>ed=2048</code> و padding بهینه شده تا از محدودیت کلودفلر رد بشه.
-            </div>
-            <div class="p-4 flex flex-wrap gap-2 border-b border-gray-100 dark:border-zinc-800 bg-gray-50/50 dark:bg-zinc-900/30">
-                <button onclick="addNewIpRow()" class="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-lg shadow-sm">+ افزودن IP جدید</button>
-                <button onclick="enableAllTransportsForAll()" class="px-3 py-1.5 bg-emerald-50 dark:bg-emerald-900/20 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-100 dark:hover:bg-emerald-900/30 border border-emerald-200 dark:border-emerald-800/50 text-xs font-bold rounded-lg">فعال همه</button>
-                <button onclick="disableAllIps()" class="px-3 py-1.5 bg-gray-100 dark:bg-zinc-800 text-gray-600 dark:text-zinc-400 hover:bg-gray-200 dark:hover:bg-zinc-700 text-xs font-bold rounded-lg">غیرفعال همه</button>
-                <button onclick="resetIpManagerToDefault()" class="px-3 py-1.5 bg-amber-50 dark:bg-amber-900/20 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/30 border border-amber-200 dark:border-amber-800/50 text-xs font-bold rounded-lg">بازنشانی به پیش‌فرض</button>
-                <button onclick="loadIpManager()" class="px-3 py-1.5 bg-white dark:bg-amoled-input border border-gray-200 dark:border-amoled-border text-gray-700 dark:text-zinc-300 hover:bg-gray-50 dark:hover:bg-zinc-800 text-xs font-bold rounded-lg">🔄 رفرش</button>
-            </div>
-            <div class="flex-1 overflow-y-auto p-4 space-y-3" id="ip-manager-list">
-                <div class="text-center py-8 text-sm text-gray-500 dark:text-zinc-400" id="ip-manager-loading">در حال بارگذاری لیست IPها...</div>
-            </div>
-            <div class="p-4 border-t border-gray-200 dark:border-amoled-border flex gap-3 bg-gray-50 dark:bg-zinc-900/50">
-                <button type="button" onclick="toggleIpManagerModal(false)" class="flex-1 py-2.5 bg-gray-100 hover:bg-gray-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 font-medium rounded-xl text-sm transition">انصراف</button>
-                <button type="button" onclick="saveIpManager()" id="save-ip-manager-btn" class="flex-1 py-2.5 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white font-bold rounded-xl text-sm transition shadow-md">💾 ذخیره تنظیمات IP و پروکسی</button>
             </div>
         </div>
     </div>
@@ -4523,231 +3728,6 @@ const HTML_TEMPLATES = {
                 card.classList.add('opacity-0', 'scale-95');
             }
         }
-
-        // 🔥 IP Manager Functions
-        const DEFAULT_IP_LIST = [
-            "add555.musicalls.ir:443#A🇹🇷",
-            "ip3.synthara.ir:443#B🇹🇷",
-            "cf-mtn.coixconqwe1.ir:443#C🇫🇮",
-            "104.17.122.116:2053#D🇫🇮",
-            "support.zoom.us:443#E🇫🇷",
-            "104.16.174.118:443#F🇫🇷",
-            "cf-mci.coixconqwe1.ir:443#G🇩🇪",
-            "69.84.182.49:443#H🇩🇪",
-            "88.198.82.158:443#I🇩🇪",
-            "104.17.121.228:443#J🇩🇪",
-            "104.16.71.14:443#K🇩🇪",
-            "104.17.122.116:2096#L🇩🇪",
-            "104.17.107.119:443#M🇳🇱",
-            "104.16.72.251:443#N🇳🇱",
-            "158.180.231.216:443#O🇸🇪",
-            "record20.zeus744.ir:443#P🇸🇪",
-            "Abot.sahoria.ir:2053#Q🇺🇸",
-            "104.18.154.96:443#R🇺🇸",
-            "198.244.235.173:179#S🇬🇧",
-            "57.128.176.37:443#T🇬🇧",
-            "104.17.121.229:443#U🇬🇧",
-            "104.18.1.1:443#V✅",
-            "discourse.ir:443#W⚡",
-            "104.18.153.252:443#X🔥",
-            "104.17.122.116:2083#آلمان1🇩🇪",
-            "104.17.122.116:2053#2آلمان‌🇩🇪",
-            "141.101.114.183:443#ایرانسل1💛",
-            "104.16.241.142:2083#ایرانسل1💛🇦🇿",
-            "173.245.58.187:2096#ایرانسل2💛🇦🇿",
-            "104.25.73.59:2083#ایرانسل2💛",
-            "104.21.3.125:443#ایرانسل💛📡",
-            "162.159.248.12:443#ایرانسل💛🚀",
-            "172.67.223.97:443#ایرانسل💛⚔️",
-            "172.67.113.199:443#ایرانسل💛⚡",
-            "167.71.45.93:443#ایرانسل💛✅",
-            "178.250.187.110:443#ایرانسل💛🛰️",
-            "104.16.1.1:443#ایرانسل💛🔥",
-            "cf-mci.coixconqwe1.ir:443#Gaming🎮"
-        ];
-
-        let ipManagerData = {}; // ipPort -> {enabled, ws, xhttp, hu, proxy, remark}
-
-        function toggleIpManagerModal(show) {
-            const modal = document.getElementById('ip-manager-modal');
-            const card = modal.querySelector('div');
-            if (show) {
-                modal.classList.remove('opacity-0', 'pointer-events-none');
-                modal.classList.add('opacity-100', 'pointer-events-auto');
-                card.classList.remove('opacity-0', 'scale-95');
-                card.classList.add('opacity-100', 'scale-100');
-                loadIpManager();
-            } else {
-                modal.classList.remove('opacity-100', 'pointer-events-auto');
-                modal.classList.add('opacity-0', 'pointer-events-none');
-                card.classList.remove('opacity-100', 'scale-100');
-                card.classList.add('opacity-0', 'scale-95');
-            }
-        }
-
-        async function loadIpManager() {
-            const listEl = document.getElementById('ip-manager-list');
-            const loadingEl = document.getElementById('ip-manager-loading');
-            if (loadingEl) loadingEl.style.display = 'block';
-            if (listEl) listEl.innerHTML = '<div class="text-center py-8 text-sm text-gray-500 dark:text-zinc-400">در حال بارگذاری...</div>';
-            try {
-                const res = await fetch('/api/ip-config');
-                const data = await res.json();
-                ipManagerData = data || {};
-                // اگر خالی بود، از DEFAULT پر کن
-                if (Object.keys(ipManagerData).length === 0) {
-                    for (const item of DEFAULT_IP_LIST) {
-                        const [addr, name] = item.split('#');
-                        const ipPort = addr;
-                        if (!ipManagerData[ipPort]) {
-                            ipManagerData[ipPort] = { enabled: true, ws: true, xhttp: true, hu: true, proxy: '', remark: name || '' };
-                        }
-                    }
-                }
-                renderIpManager();
-            } catch (e) {
-                console.error(e);
-                // fallback default
-                ipManagerData = {};
-                for (const item of DEFAULT_IP_LIST) {
-                    const [addr, name] = item.split('#');
-                    ipManagerData[addr] = { enabled: true, ws: true, xhttp: true, hu: true, proxy: '', remark: name || '' };
-                }
-                renderIpManager();
-            }
-        }
-
-        function renderIpManager() {
-            const listEl = document.getElementById('ip-manager-list');
-            if (!listEl) return;
-            const keys = Object.keys(ipManagerData);
-            if (keys.length === 0) {
-                listEl.innerHTML = '<div class="text-center py-8 text-sm text-gray-400">هیچ IPای یافت نشد. روی افزودن کلیک کن.</div>';
-                return;
-            }
-            let html = '';
-            for (const ipPort of keys) {
-                const conf = ipManagerData[ipPort] || { enabled: true, ws: true, xhttp: true, hu: true, proxy: '', remark: '' };
-                const enabledChecked = conf.enabled ? 'checked' : '';
-                const wsChecked = conf.ws ? 'checked' : '';
-                const xhttpChecked = conf.xhttp ? 'checked' : '';
-                const huChecked = conf.hu ? 'checked' : '';
-                html += `<div class="border border-gray-200 dark:border-zinc-800 rounded-xl p-3 bg-white dark:bg-zinc-900/30 space-y-2">
-                    <div class="flex items-center justify-between gap-2">
-                        <div class="flex items-center gap-2 flex-1 min-w-0">
-                            <input type="checkbox" ${enabledChecked} onchange="ipManagerData['${ipPort}'].enabled=this.checked" class="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500">
-                            <input type="text" value="${ipPort}" onchange="updateIpKey('${ipPort}', this.value)" class="flex-1 px-2 py-1.5 bg-gray-50 dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 rounded-lg text-xs font-mono font-bold text-gray-800 dark:text-zinc-100" placeholder="IP:Port">
-                            <input type="text" value="${(conf.remark||'').replace(/"/g,'&quot;')}" onchange="ipManagerData['${ipPort}'].remark=this.value" class="w-20 px-2 py-1.5 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800/50 rounded-lg text-[11px] font-bold text-amber-700 dark:text-amber-300" placeholder="نام">
-                        </div>
-                        <button onclick="deleteIpRow('${ipPort}')" class="p-1.5 bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-900/30 rounded-lg text-xs">🗑️</button>
-                    </div>
-                    <div class="grid grid-cols-3 gap-2">
-                        <label class="flex items-center gap-1.5 px-2 py-1.5 bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-200 dark:border-indigo-800/30 rounded-lg cursor-pointer hover:bg-indigo-100 dark:hover:bg-indigo-900/30 transition">
-                            <input type="checkbox" ${wsChecked} onchange="ipManagerData['${ipPort}'].ws=this.checked" class="w-3 h-3 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500">
-                            <span class="text-[11px] font-bold text-indigo-700 dark:text-indigo-300">WS</span>
-                        </label>
-                        <label class="flex items-center gap-1.5 px-2 py-1.5 bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-200 dark:border-emerald-800/30 rounded-lg cursor-pointer hover:bg-emerald-100 dark:hover:bg-emerald-900/30 transition">
-                            <input type="checkbox" ${xhttpChecked} onchange="ipManagerData['${ipPort}'].xhttp=this.checked" class="w-3 h-3 rounded border-gray-300 text-emerald-600 focus:ring-emerald-500">
-                            <span class="text-[11px] font-bold text-emerald-700 dark:text-emerald-300">XHTTP</span>
-                        </label>
-                        <label class="flex items-center gap-1.5 px-2 py-1.5 bg-orange-50 dark:bg-orange-900/20 border border-orange-200 dark:border-orange-800/30 rounded-lg cursor-pointer hover:bg-orange-100 dark:hover:bg-orange-900/30 transition">
-                            <input type="checkbox" ${huChecked} onchange="ipManagerData['${ipPort}'].hu=this.checked" class="w-3 h-3 rounded border-gray-300 text-orange-600 focus:ring-orange-500">
-                            <span class="text-[11px] font-bold text-orange-700 dark:text-orange-300">HU</span>
-                        </label>
-                    </div>
-                    <div class="flex items-center gap-2">
-                        <span class="text-[10px] font-bold text-gray-500 dark:text-zinc-400 whitespace-nowrap">🌐 پروکسی اختیاری:</span>
-                        <input type="text" value="${(conf.proxy||'').replace(/"/g,'&quot;')}" onchange="ipManagerData['${ipPort}'].proxy=this.value" placeholder="user:pass@host:port یا خالی" class="flex-1 px-2 py-1.5 bg-blue-50/50 dark:bg-blue-900/10 border border-blue-200 dark:border-blue-800/30 rounded-lg text-[11px] font-mono text-blue-700 dark:text-blue-300 placeholder-blue-300/50" dir="ltr">
-                    </div>
-                </div>`;
-            }
-            listEl.innerHTML = html;
-        }
-
-        function updateIpKey(oldKey, newKey) {
-            newKey = newKey.trim();
-            if (!newKey || newKey === oldKey) return;
-            if (ipManagerData[newKey]) {
-                alert('این IP از قبل وجود دارد!');
-                renderIpManager();
-                return;
-            }
-            ipManagerData[newKey] = ipManagerData[oldKey];
-            delete ipManagerData[oldKey];
-            renderIpManager();
-        }
-
-        function deleteIpRow(ipPort) {
-            if (confirm('حذف IP ' + ipPort + ' ؟')) {
-                delete ipManagerData[ipPort];
-                renderIpManager();
-            }
-        }
-
-        function addNewIpRow() {
-            const newIp = prompt('IP جدید را وارد کن (مثال: 1.2.3.4:443):');
-            if (!newIp) return;
-            const trimmed = newIp.trim();
-            if (ipManagerData[trimmed]) {
-                alert('این IP از قبل وجود دارد');
-                return;
-            }
-            ipManagerData[trimmed] = { enabled: true, ws: true, xhttp: true, hu: true, proxy: '', remark: 'Custom' };
-            renderIpManager();
-        }
-
-        function enableAllTransportsForAll() {
-            for (const k in ipManagerData) {
-                ipManagerData[k].enabled = true;
-                ipManagerData[k].ws = true;
-                ipManagerData[k].xhttp = true;
-                ipManagerData[k].hu = true;
-            }
-            renderIpManager();
-        }
-
-        function disableAllIps() {
-            for (const k in ipManagerData) {
-                ipManagerData[k].enabled = false;
-            }
-            renderIpManager();
-        }
-
-        function resetIpManagerToDefault() {
-            if (!confirm('بازنشانی به لیست پیش‌فرض؟ تمام تنظیمات پروکسی پاک می‌شود!')) return;
-            ipManagerData = {};
-            for (const item of DEFAULT_IP_LIST) {
-                const [addr, name] = item.split('#');
-                ipManagerData[addr] = { enabled: true, ws: true, xhttp: true, hu: true, proxy: '', remark: name || '' };
-            }
-            renderIpManager();
-        }
-
-        async function saveIpManager() {
-            const btn = document.getElementById('save-ip-manager-btn');
-            btn.disabled = true;
-            btn.innerText = 'در حال ذخیره...';
-            try {
-                const res = await fetch('/api/ip-config', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(ipManagerData)
-                });
-                const data = await res.json();
-                if (res.ok && data.success) {
-                    alert('✅ تنظیمات IP و پروکسی با موفقیت ذخیره شد!');
-                    toggleIpManagerModal(false);
-                } else {
-                    alert('❌ خطا: ' + (data.error || 'ناموفق'));
-                }
-            } catch (e) {
-                alert('❌ خطا در ارتباط: ' + e.message);
-            } finally {
-                btn.disabled = false;
-                btn.innerText = '💾 ذخیره تنظیمات IP و پروکسی';
-            }
-        }
-        
         function toggleModal(show) {
             const modal = document.getElementById('user-modal');
             const card = document.getElementById('user-modal-card');
