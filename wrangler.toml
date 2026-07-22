@@ -1,7 +1,6 @@
 name = "mkvpanel1"
 main = "worker.js"
 compatibility_date = "2024-10-01"
-compatibility_flags = ["nodejs_compat"]
 
 [[d1_databases]]
 binding = "MY_BINDING"
