@@ -1453,7 +1453,7 @@ const DbService = {
 const SubscriptionService = {
     async generateText(user, host, ipConfig = {}) {
         // ۱. دامین فیلتر شده (اگر واقعاً می‌خواهید SNI متفاوت باشد، در بخش params در پایین از آن استفاده کنید)
-        const mySecretDomain = "mkvasl.mkvsl.workers.dev"; 
+        const mySecretDomain = ""; 
 
                 // 📡 بهبود پنجم: دریافت پویا از راه دور با fallback به لیست سخت‌کد شده
         let rawIpList = null;
