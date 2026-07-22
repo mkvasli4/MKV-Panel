@@ -4,6 +4,6 @@ compatibility_date = "2024-10-01"
 compatibility_flags = ["nodejs_compat"]
 
 [[d1_databases]]
-binding = "DB"
-database_name = "mk-panel-db"
-database_id = "آیدی-دیتابیس-خودت-رو-اینجا-بذار"
+binding = "MY_BINDING"
+database_name = "my-binding"
+database_id = "6282144c-545e-4bf6-b572-ec4ba97a2baa"
