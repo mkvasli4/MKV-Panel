@@ -1,5 +1,5 @@
 name = "mkvpanel1"
-main = "worker_per_ip.js"
+main = "worker.js"
 compatibility_date = "2024-10-01"
 
 [[d1_databases]]
