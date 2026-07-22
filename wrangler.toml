@@ -1,4 +1,4 @@
-name = "mkvpanel1"
+name = "mkvpanel"
 main = "zeus.js"
 compatibility_date = "2024-10-01"
 
